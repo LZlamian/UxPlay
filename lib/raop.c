@@ -88,6 +88,10 @@ struct raop_s {
     /* activate support for HLS live streaming */
     bool hls_support;
 
+    /* Use an AirServer-style initial /info profile and accept pair-verify
+     * immediately as a compatibility fallback. */
+    bool fast_connect;
+
     /* used in digest authentication */
     char *nonce;
     char *random_pw;
@@ -399,6 +403,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     }
 
     logger_log(raop->logger, LOGGER_DEBUG, "Handling request %s with URL %s", method, url);
+    if (raop->callbacks.conn_request_timing) {
+        raop->callbacks.conn_request_timing(raop->callbacks.cls, method, url, true);
+    }
     raop_handler_t handler = NULL;
     if (!hls_request && !strcmp(protocol, "RTSP/1.0")) {
         if (!strcmp(method, "POST")) {
@@ -487,6 +494,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         }
     }
     http_response_finish(*response, response_data, response_datalen);
+    if (raop->callbacks.conn_request_timing) {
+        raop->callbacks.conn_request_timing(raop->callbacks.cls, method, url, false);
+    }
 
     int len = 0;
     const char *data = http_response_get_data(*response, &len);
@@ -635,6 +645,7 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->audio_delay_micros = 250000;
 
     raop->hls_support = false;
+    raop->fast_connect = false;
 
     raop->nonce = NULL;
 
@@ -790,10 +801,22 @@ raop_set_tcp_ports(raop_t *raop, unsigned short tcp[2]) {
     raop->port = tcp[1];
 }
 
+void
+raop_set_fast_connect(raop_t *raop, bool enabled) {
+    assert(raop);
+    raop->fast_connect = enabled;
+}
+
 unsigned short
 raop_get_port(raop_t *raop) {
     assert(raop);
     return raop->port;
+}
+
+const char *
+raop_get_pk_str(raop_t *raop) {
+    assert(raop);
+    return raop->pk_str;
 }
 
 void *

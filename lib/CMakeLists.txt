@@ -1,4 +1,6 @@
 include_directories( playfair llhttp )
+add_subdirectory( playfair )
+add_subdirectory( llhttp )
 
 message( STATUS "*** CFLAGS \"" ${CMAKE_C_FLAGS} "\" from build environment will be postpended to CMAKE_CFLAGS" )
 

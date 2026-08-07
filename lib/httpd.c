@@ -280,6 +280,17 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
         return -1;
     }
 
+    /* AirPlay setup is a latency-sensitive request/response exchange made up
+     * of small RTSP messages.  Send each response immediately instead of
+     * allowing Nagle's algorithm to coalesce it behind unacknowledged data. */
+    int tcp_nodelay = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                   (const char *) &tcp_nodelay, sizeof(tcp_nodelay)) == -1) {
+        logger_log(httpd->logger, LOGGER_WARNING,
+                   "Could not set TCP_NODELAY on accepted socket %d: %d",
+                   fd, SOCKET_GET_ERROR());
+    }
+
     local_saddrlen = sizeof(local_saddr);
     ret = getsockname(fd, (struct sockaddr *)&local_saddr, &local_saddrlen);
     if (ret == -1) {
@@ -407,6 +418,7 @@ httpd_thread(void *arg)
 
         if (httpd->open_connections < httpd->max_connections &&
             httpd->server_fd4 != -1 && FD_ISSET(httpd->server_fd4, &rfds)) {
+            logger_log(httpd->logger, LOGGER_INFO, "httpd: Accepting new IPv4 connection");
             ret = httpd_accept_connection(httpd, httpd->server_fd4, 0);
             if (ret == -1) {
                 logger_log(httpd->logger, LOGGER_ERR, "httpd error in accept ipv4");
@@ -414,9 +426,11 @@ httpd_thread(void *arg)
             } else if (ret == 0) {
                 continue;
             }
+            logger_log(httpd->logger, LOGGER_INFO, "httpd: IPv4 connection accepted successfully");
         }
         if (httpd->open_connections < httpd->max_connections &&
             httpd->server_fd6 != -1 && FD_ISSET(httpd->server_fd6, &rfds)) {
+            logger_log(httpd->logger, LOGGER_INFO, "httpd: Accepting new IPv6 connection");
             ret = httpd_accept_connection(httpd, httpd->server_fd6, 1);
             if (ret == -1) {
                 logger_log(httpd->logger, LOGGER_ERR, "httpd error in accept ipv6");
@@ -424,6 +438,7 @@ httpd_thread(void *arg)
             } else if (ret == 0) {
                 continue;
             }
+            logger_log(httpd->logger, LOGGER_INFO, "httpd: IPv6 connection accepted successfully");
         }
         for (i=0; i<httpd->max_connections; i++) {
             http_connection_t *connection = &httpd->connections[i];
@@ -635,46 +650,98 @@ httpd_start(httpd_t *httpd, unsigned short *port)
     assert(httpd);
     assert(port);
 
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: attempting to start on port %d", *port);
+    }
+
     MUTEX_LOCK(httpd->run_mutex);
     if (httpd->running || !httpd->joined) {
+        if (httpd->logger) {
+            logger_log(httpd->logger, LOGGER_WARNING, "httpd_start: already running or not joined");
+        }
         MUTEX_UNLOCK(httpd->run_mutex);
         return 0;
     }
 
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: initializing IPv4 socket");
+    }
     httpd->server_fd4 = netutils_init_socket(port, 0, 0);
     if (httpd->server_fd4 == -1) {
-        logger_log(httpd->logger, LOGGER_ERR, "Error initialising socket %d", SOCKET_GET_ERROR());
+        if (httpd->logger) {
+            logger_log(httpd->logger, LOGGER_ERR, "httpd_start: Error initialising socket %d", SOCKET_GET_ERROR());
+        }
         MUTEX_UNLOCK(httpd->run_mutex);
         return -1;
     }
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: IPv4 socket initialized successfully");
+    }
+
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: initializing IPv6 socket");
+    }
     httpd->server_fd6 = netutils_init_socket(port, 1, 0);
         if (httpd->server_fd6 == -1) {
-            logger_log(httpd->logger, LOGGER_WARNING, "Error initialising IPv6 socket %d", SOCKET_GET_ERROR());
-            logger_log(httpd->logger, LOGGER_WARNING, "Continuing without IPv6 support");
+            if (httpd->logger) {
+                logger_log(httpd->logger, LOGGER_WARNING, "httpd_start: Error initialising IPv6 socket %d", SOCKET_GET_ERROR());
+                logger_log(httpd->logger, LOGGER_WARNING, "httpd_start: Continuing without IPv6 support");
+            }
+        } else {
+            if (httpd->logger) {
+                logger_log(httpd->logger, LOGGER_INFO, "httpd_start: IPv6 socket initialized successfully");
+            }
         }
 
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: starting to listen on IPv4 socket");
+    }
     if (httpd->server_fd4 != -1 && listen(httpd->server_fd4, backlog) == -1) {
-        logger_log(httpd->logger, LOGGER_ERR, "Error listening to IPv4 socket");
+        if (httpd->logger) {
+            logger_log(httpd->logger, LOGGER_ERR, "httpd_start: Error listening to IPv4 socket");
+        }
         closesocket(httpd->server_fd4);
         closesocket(httpd->server_fd6);
         MUTEX_UNLOCK(httpd->run_mutex);
         return -2;
     }
-    if (httpd->server_fd6 != -1 && listen(httpd->server_fd6, backlog) == -1) {
-        logger_log(httpd->logger, LOGGER_ERR, "Error listening to IPv6 socket");
-        closesocket(httpd->server_fd4);
-        closesocket(httpd->server_fd6);
-        MUTEX_UNLOCK(httpd->run_mutex);
-        return -2;
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: listening on IPv4 socket successfully");
     }
-    logger_log(httpd->logger, LOGGER_INFO, "Initialized server socket(s)");
+
+    if (httpd->server_fd6 != -1) {
+        if (httpd->logger) {
+            logger_log(httpd->logger, LOGGER_INFO, "httpd_start: starting to listen on IPv6 socket");
+        }
+        if (listen(httpd->server_fd6, backlog) == -1) {
+            if (httpd->logger) {
+                logger_log(httpd->logger, LOGGER_ERR, "httpd_start: Error listening to IPv6 socket");
+            }
+            closesocket(httpd->server_fd4);
+            closesocket(httpd->server_fd6);
+            MUTEX_UNLOCK(httpd->run_mutex);
+            return -2;
+        }
+        if (httpd->logger) {
+            logger_log(httpd->logger, LOGGER_INFO, "httpd_start: listening on IPv6 socket successfully");
+        }
+    }
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: Initialized server socket(s)");
+    }
 
     /* Set values correctly and create new thread */
     httpd->running = 1;
     httpd->joined = 0;
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: creating HTTP thread");
+    }
     THREAD_CREATE(httpd->thread, httpd_thread, httpd);
     MUTEX_UNLOCK(httpd->run_mutex);
 
+    if (httpd->logger) {
+        logger_log(httpd->logger, LOGGER_INFO, "httpd_start: HTTP server started successfully on port %d", *port);
+    }
     return 1;
 }
 

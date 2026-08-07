@@ -82,6 +82,8 @@ struct raop_callbacks_s {
     /* Optional but recommended callback functions (probably not optional, check this)*/
     void  (*conn_init)(void *cls);
     void  (*conn_destroy)(void *cls);
+    void  (*conn_request_timing)(void *cls, const char *method, const char *url, bool started);
+    void  (*mirror_connection_timing)(void *cls, bool first_data);
     void  (*conn_teardown)(void *cls, bool *teardown_96, bool *teardown_110 );
     void  (*audio_flush)(void *cls);
     void  (*video_flush)(void *cls);
@@ -130,8 +132,10 @@ RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
 RAOP_API void raop_set_lang(raop_t *raop, const char *lang);
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);
 RAOP_API void raop_set_tcp_ports(raop_t *raop, unsigned short port[2]);
+RAOP_API void raop_set_fast_connect(raop_t *raop, bool enabled);
 RAOP_API unsigned short raop_get_port(raop_t *raop);
 RAOP_API void *raop_get_callback_cls(raop_t *raop);
+RAOP_API const char *raop_get_pk_str(raop_t *raop);
 RAOP_API int raop_start_httpd(raop_t *raop, unsigned short *port);
 RAOP_API int raop_is_running(raop_t *raop);
 RAOP_API void raop_stop_httpd(raop_t *raop);

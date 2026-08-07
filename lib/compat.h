@@ -27,6 +27,7 @@
 #include <sys/ioctl.h>
 #include <sys/time.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <errno.h>
