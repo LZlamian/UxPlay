@@ -108,10 +108,11 @@ logger_log(logger_t *logger, int level, const char *fmt, ...)
         snprintf(err_buf, sizeof(err_buf), err_fmt, message_len, (int) sizeof(buffer) -1);
     }
     MUTEX_LOCK(logger->cb_mutex);
-    assert (logger->callback);
-    logger->callback(logger->cls, level, buffer);
-    if (err_buf[0]) {
-        logger->callback(logger->cls, level, err_buf);
+    if (logger->callback) {
+        logger->callback(logger->cls, level, buffer);
+        if (err_buf[0]) {
+            logger->callback(logger->cls, level, err_buf);
+        }
     }
     MUTEX_UNLOCK(logger->cb_mutex);
 }

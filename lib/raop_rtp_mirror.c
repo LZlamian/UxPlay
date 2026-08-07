@@ -204,6 +204,7 @@ raop_rtp_mirror_thread(void *arg)
     bool unsupported_codec = false;
     bool video_stream_suspended = false;
     bool first_packet = true;
+    bool first_header_reported = false;
     
     while (1) {
         fd_set rfds;
@@ -254,6 +255,10 @@ raop_rtp_mirror_thread(void *arg)
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
                            "raop_rtp_mirror error in accept %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
                 break;
+            }
+            if (raop_rtp_mirror->callbacks.mirror_connection_timing) {
+                raop_rtp_mirror->callbacks.mirror_connection_timing(
+                    raop_rtp_mirror->callbacks.cls, false);
             }
 
             // We're calling recv for a certain amount of data, so we need a timeout
@@ -320,6 +325,14 @@ raop_rtp_mirror_thread(void *arg)
                            "raop_rtp_mirror error  in header recv: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
                 if (sock_err == SOCKET_ERRORNAME(ECONNRESET)) conn_reset = true;; 
                 break;
+            }
+
+            if (!first_header_reported && readstart == 128) {
+                if (raop_rtp_mirror->callbacks.mirror_connection_timing) {
+                    raop_rtp_mirror->callbacks.mirror_connection_timing(
+                        raop_rtp_mirror->callbacks.cls, true);
+                }
+                first_header_reported = true;
             }
 
             /*packet[0:3] contains the payload size */

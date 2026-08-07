@@ -300,6 +300,17 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
         return -1;
     }
 
+    /* AirPlay setup is a latency-sensitive request/response exchange made up
+     * of small RTSP messages.  Send each response immediately instead of
+     * allowing Nagle's algorithm to coalesce it behind unacknowledged data. */
+    int tcp_nodelay = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
+                   (const char *) &tcp_nodelay, sizeof(tcp_nodelay)) == -1) {
+        logger_log(httpd->logger, LOGGER_WARNING,
+                   "Could not set TCP_NODELAY on accepted socket %d: %d",
+                   fd, SOCKET_GET_ERROR());
+    }
+
     local_saddrlen = sizeof(local_saddr);
     ret = getsockname(fd, (struct sockaddr *)&local_saddr, &local_saddrlen);
     if (ret == -1) {

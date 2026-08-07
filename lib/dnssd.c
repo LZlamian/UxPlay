@@ -151,6 +151,8 @@ struct dnssd_s {
     uint32_t features1;
     uint32_t features2;
 
+    bool airserver_profile;
+
     unsigned char pin_pw;
 };
 
@@ -173,6 +175,7 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
     }
 
     dnssd->pin_pw = pin_pw;
+    dnssd->airserver_profile = false;
 
     char *end = NULL;
     unsigned long features  = strtoul(FEATURES_1, &end, 16);
@@ -299,9 +302,14 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "cn", strlen(RAOP_CN), RAOP_CN);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "da", strlen(RAOP_DA), RAOP_DA);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "et", strlen(RAOP_ET), RAOP_ET);
-    dnssd->TXTRecordSetValue(&dnssd->raop_record, "vv", strlen(RAOP_VV), RAOP_VV);
+    const char *vv = RAOP_VV;
+    dnssd->TXTRecordSetValue(&dnssd->raop_record, "vv", strlen(vv), vv);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "ft", strlen(features), features);
-    dnssd->TXTRecordSetValue(&dnssd->raop_record, "am", strlen(GLOBAL_MODEL), GLOBAL_MODEL);
+    const char *model = dnssd->airserver_profile ? "AppleTV5,3" : GLOBAL_MODEL;
+    const char *source_version = dnssd->airserver_profile ? "220.68" : RAOP_VS;
+    const char *status_flags = RAOP_SF;
+
+    dnssd->TXTRecordSetValue(&dnssd->raop_record, "am", strlen(model), model);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "md", strlen(RAOP_MD), RAOP_MD);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "rhd", strlen(RAOP_RHD), RAOP_RHD);
     switch (dnssd->pin_pw) {
@@ -316,7 +324,7 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
         break;
     default:
         dnssd->TXTRecordSetValue(&dnssd->raop_record, "pw", strlen("false"), "false");
-        dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", strlen(RAOP_SF), RAOP_SF);
+        dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", strlen(status_flags), status_flags);
         break;
     }
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "sr", strlen(RAOP_SR), RAOP_SR);
@@ -324,8 +332,7 @@ dnssd_register_raop(dnssd_t *dnssd, unsigned short port)
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "sv", strlen(RAOP_SV), RAOP_SV);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "tp", strlen(RAOP_TP), RAOP_TP);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "txtvers", strlen(RAOP_TXTVERS), RAOP_TXTVERS);
-    dnssd->TXTRecordSetValue(&dnssd->raop_record, "sf", strlen(RAOP_SF), RAOP_SF);
-    dnssd->TXTRecordSetValue(&dnssd->raop_record, "vs", strlen(RAOP_VS), RAOP_VS);
+    dnssd->TXTRecordSetValue(&dnssd->raop_record, "vs", strlen(source_version), source_version);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "vn", strlen(RAOP_VN), RAOP_VN);
     dnssd->TXTRecordSetValue(&dnssd->raop_record, "pk", strlen(dnssd->pk), dnssd->pk);
 
@@ -372,7 +379,11 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
         return -1;
     }
 
-    // flags is a string representing a 20-bit flag (up to 3 hex digits)
+    const char *model = dnssd->airserver_profile ? "AppleTV5,3" : GLOBAL_MODEL;
+    const char *source_version = dnssd->airserver_profile ? "220.68" : AIRPLAY_SRCVERS;
+    const char *status_flags = "0x4";
+
+    // flags is a string representing the receiver status flags.
     dnssd->TXTRecordCreate(&dnssd->airplay_record, 0, NULL);
     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "deviceid", strlen(device_id), device_id);
     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "features", strlen(features), features);
@@ -388,14 +399,15 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
         break;
     default:
         dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pw", strlen("false"), "false");
-        dnssd->TXTRecordSetValue(&dnssd->airplay_record, "flags", 3, "0x4");
+        dnssd->TXTRecordSetValue(&dnssd->airplay_record, "flags", strlen(status_flags), status_flags);
         break;
     }
-    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "model", strlen(GLOBAL_MODEL), GLOBAL_MODEL);
+    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "model", strlen(model), model);
     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pk", strlen(dnssd->pk), dnssd->pk);
     dnssd->TXTRecordSetValue(&dnssd->airplay_record, "pi", strlen(AIRPLAY_PI), AIRPLAY_PI);
-    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "srcvers", strlen(AIRPLAY_SRCVERS), AIRPLAY_SRCVERS);
-    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "vv", strlen(AIRPLAY_VV), AIRPLAY_VV);
+    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "srcvers", strlen(source_version), source_version);
+    const char *vv = AIRPLAY_VV;
+    dnssd->TXTRecordSetValue(&dnssd->airplay_record, "vv", strlen(vv), vv);
 
     /* Register the service */
     DNSServiceErrorType retval = dnssd->DNSServiceRegister(&dnssd->airplay_service, 0, 0,
@@ -412,6 +424,10 @@ dnssd_register_airplay(dnssd_t *dnssd, unsigned short port)
 const char *
 dnssd_get_raop_txt(dnssd_t *dnssd, int *length)
 {
+    if (!dnssd) {
+        *length = 0;
+        return "";
+    }
     *length = dnssd->TXTRecordGetLength(&dnssd->raop_record);
     return dnssd->TXTRecordGetBytesPtr(&dnssd->raop_record);
 }
@@ -419,6 +435,10 @@ dnssd_get_raop_txt(dnssd_t *dnssd, int *length)
 const char *
 dnssd_get_airplay_txt(dnssd_t *dnssd, int *length)
 {
+    if (!dnssd) {
+        *length = 0;
+        return "";
+    }
     *length = dnssd->TXTRecordGetLength(&dnssd->airplay_record);
     return dnssd->TXTRecordGetBytesPtr(&dnssd->airplay_record);
 }
@@ -426,6 +446,10 @@ dnssd_get_airplay_txt(dnssd_t *dnssd, int *length)
 const char *
 dnssd_get_name(dnssd_t *dnssd, int *length)
 {
+    if (!dnssd) {
+        *length = 0;
+        return "";
+    }
     *length = dnssd->name_len;
     return dnssd->name;
 }
@@ -433,6 +457,10 @@ dnssd_get_name(dnssd_t *dnssd, int *length)
 const char *
 dnssd_get_hw_addr(dnssd_t *dnssd, int *length)
 {
+    if (!dnssd) {
+        *length = 0;
+        return "";
+    }
     *length = dnssd->hw_addr_len;
     return dnssd->hw_addr;
 }
@@ -480,16 +508,36 @@ dnssd_unregister_airplay(dnssd_t *dnssd)
 }
 
 uint64_t dnssd_get_airplay_features(dnssd_t *dnssd) {
+    if (!dnssd) {
+        return 0;
+    }
     uint64_t features = ((uint64_t) dnssd->features2) << 32;
     features += (uint64_t) dnssd->features1;
     return features;
 }
 
+void dnssd_set_airserver_profile(dnssd_t *dnssd, bool enabled) {
+    if (!dnssd) {
+        return;
+    }
+    dnssd->airserver_profile = enabled;
+    if (enabled) {
+        dnssd->features1 = 0x427FFFF7;
+        dnssd->features2 = 0x0000000E;
+    }
+}
+
 void dnssd_set_pk(dnssd_t *dnssd, char * pk_str) {
+    if (!dnssd) {
+        return;
+    }
     dnssd->pk = pk_str;
 }
 
 void dnssd_set_airplay_features(dnssd_t *dnssd, int bit, int val) {
+    if (!dnssd) {
+        return;
+    }
     uint32_t mask = 0;
     uint32_t *features = 0;
     if (bit < 0 || bit > 63) return;

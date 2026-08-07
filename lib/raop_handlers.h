@@ -93,7 +93,12 @@ raop_handler_info(raop_conn_t *conn,
         add_txt_raop = (bool) strstr(url, txtRAOP);
     }
     
-    if (add_txt_airplay) {
+    /* AirServer answers the initial txtAirPlay-qualified request with its full
+     * runtime /info plist.  That lets the sender see the no-legacy-pairing
+     * profile before it chooses a connection flow. */
+    const bool fast_full_info = raop->fast_connect && add_txt_airplay;
+
+    if (add_txt_airplay && !fast_full_info) {
         const char *txt = dnssd_get_airplay_txt(raop->dnssd, &len);
         plist_t txt_airplay_node = plist_new_data(txt, len);
         plist_dict_set_item(res_node, txtAirPlay, txt_airplay_node);
@@ -106,7 +111,7 @@ raop_handler_info(raop_conn_t *conn,
     }
   
     /* don't need anything below here in the response to initial  "txtAirPlay" GET/info request */
-    if (content_type) {
+    if (content_type && !fast_full_info) {
         goto finished;
     }
  
@@ -131,6 +136,9 @@ raop_handler_info(raop_conn_t *conn,
     free(pk);
 
     uint64_t features = dnssd_get_airplay_features(raop->dnssd);
+    if (raop->fast_connect) {
+        features = UINT64_C(0x0000000E427FFFF7);
+    }
     plist_t features_node = plist_new_uint(features);
     plist_dict_set_item(res_node, "features", features_node);
 
@@ -145,7 +153,7 @@ raop_handler_info(raop_conn_t *conn,
     plist_t vv_node = plist_new_uint(strtol(AIRPLAY_VV, NULL, 10));
     plist_dict_set_item(res_node, "vv", vv_node);
 
-    plist_t status_flags_node = plist_new_uint(68);
+    plist_t status_flags_node = plist_new_uint(raop->fast_connect ? 4 : 68);
     plist_dict_set_item(res_node, "statusFlags", status_flags_node);
 
     plist_t keep_alive_low_power_node = plist_new_uint(1);
@@ -157,7 +165,7 @@ raop_handler_info(raop_conn_t *conn,
     plist_t keep_alive_send_stats_as_body_node = plist_new_bool(1);
     plist_dict_set_item(res_node, "keepAliveSendStatsAsBody", keep_alive_send_stats_as_body_node);
 
-    plist_t model_node = plist_new_string(GLOBAL_MODEL);
+    plist_t model_node = plist_new_string(raop->fast_connect ? "AppleTV5,3" : GLOBAL_MODEL);
     plist_dict_set_item(res_node, "model", model_node);
 
     /* dont need anything below here in the Bluetooth LE response */
@@ -475,6 +483,11 @@ raop_handler_pairverify(raop_conn_t *conn,
         if (raop->use_pin) {
             pairing_session_set_setup_status(conn->session);
             register_check = true;
+        } else if (raop->fast_connect) {
+            /* The sender already has our long-term public key from /info.
+             * Accept its first pair-verify directly instead of forcing a
+             * redundant pair-setup followed by another pair-verify. */
+            pairing_session_set_setup_status(conn->session);
         } else {
             return;
         }
