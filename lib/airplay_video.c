@@ -22,6 +22,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "raop.h"
 #include "airplay_video.h"
@@ -51,6 +52,8 @@ struct airplay_video_s {
     char *uri_prefix;
     char *local_uri_prefix;
     char *playback_location;
+    char *spooled_media_path;
+    bool reverse_media_pending;
     char *language_name;
     char *language_code;
     const char *lang;
@@ -93,6 +96,8 @@ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short http_port, cons
     airplay_video->playback_uuid = NULL;
     airplay_video->uri_prefix = NULL;
     airplay_video->playback_location = NULL;
+    airplay_video->spooled_media_path = NULL;
+    airplay_video->reverse_media_pending = false;
     airplay_video->language_code = NULL;
     airplay_video->language_name = NULL;
     airplay_video->media_data_store = NULL;
@@ -119,6 +124,10 @@ airplay_video_destroy(airplay_video_t *airplay_video) {
     }
     if (airplay_video->playback_location) {
         free(airplay_video->playback_location);
+    }
+    if (airplay_video->spooled_media_path) {
+        unlink(airplay_video->spooled_media_path);
+        free(airplay_video->spooled_media_path);
     }
     if (airplay_video->language_name) {
         free(airplay_video->language_name);
@@ -194,6 +203,35 @@ void set_playback_location(airplay_video_t *airplay_video, const char *location,
     }
     airplay_video->playback_location = str;
     str = NULL;
+}
+
+void set_reverse_media_pending(airplay_video_t *airplay_video, bool pending) {
+    if (airplay_video) {
+        airplay_video->reverse_media_pending = pending;
+    }
+}
+
+bool get_reverse_media_pending(airplay_video_t *airplay_video) {
+    return airplay_video && airplay_video->reverse_media_pending;
+}
+
+bool set_spooled_media_path(airplay_video_t *airplay_video, const char *path, size_t len) {
+    if (!airplay_video) return false;
+    if (airplay_video->spooled_media_path) {
+        unlink(airplay_video->spooled_media_path);
+        free(airplay_video->spooled_media_path);
+        airplay_video->spooled_media_path = NULL;
+    }
+    if (!path || !len) return true;
+    char *copy = (char *) calloc(len + 1, sizeof(char));
+    if (!copy) return false;
+    memcpy(copy, path, len);
+    airplay_video->spooled_media_path = copy;
+    return true;
+}
+
+const char *get_spooled_media_path(airplay_video_t *airplay_video) {
+    return airplay_video ? airplay_video->spooled_media_path : NULL;
 }
 
 void set_language_name(airplay_video_t *airplay_video, const char *language_name, size_t len) {

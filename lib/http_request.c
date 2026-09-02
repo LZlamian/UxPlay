@@ -23,6 +23,10 @@
 #include "http_request.h"
 #include "llhttp/llhttp.h"
 
+/* FCUP can return a complete page-local media object in one binary plist.
+ * Keep request accumulation bounded before plist parsing duplicates it. */
+#define MAX_HTTP_REQUEST_BODY_BYTES (129U * 1024U * 1024U)
+
 struct http_request_s {
     llhttp_t parser;
     llhttp_settings_t parser_settings;
@@ -123,6 +127,11 @@ static int
 on_body(llhttp_t *parser, const char *at, size_t length)
 {
     http_request_t *request = parser->data;
+
+    if (length > MAX_HTTP_REQUEST_BODY_BYTES || request->datalen < 0 ||
+        (size_t) request->datalen > MAX_HTTP_REQUEST_BODY_BYTES - length) {
+        return -1;
+    }
 
     request->data = realloc(request->data, request->datalen + length);
     assert(request->data);
