@@ -268,7 +268,13 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     const char *client_session_id = http_request_get_header(request, "X-Apple-Session-ID");
     const char *host = http_request_get_header(request, "Host");
-    hls_request =  (host && !cseq && !client_session_id);
+    /* HLS proxy traffic is always a GET.  Classic AirPlay /play requests may
+       legitimately omit X-Apple-Session-ID, so classifying every sessionless
+       HTTP request as HLS sends POST /play to a GET-only handler. */
+    hls_request = (host && !cseq && !client_session_id &&
+                   !strcmp(method, "GET") &&
+                   strcmp(url, "/server-info") &&
+                   strcmp(url, "/playback-info"));
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq || ble) {
@@ -366,7 +372,13 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         if (request_data) {
             if (request_datalen > 0) {
                 /* logger has a buffer limit of 4096 */
-                if (data_is_plist) {
+                if (!strcmp(url, "/play")) {
+                    /* Content-Location can contain signed URLs or credentials.
+                       The play handler logs only sanitized metadata. */
+                    logger_log(raop->logger, LOGGER_DEBUG,
+                               "[MEDIA] /play request body omitted from log (%d bytes)",
+                               request_datalen);
+                } else if (data_is_plist) {
                     plist_t req_root_node = NULL;
                     plist_from_bin(request_data, request_datalen, &req_root_node);
                     char * plist_xml = NULL;
