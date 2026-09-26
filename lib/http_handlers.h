@@ -36,7 +36,7 @@ static void
 *hls_get_current_video(raop_t *raop) {
     if (raop->current_video < 0 || raop->current_video >= MAX_AIRPLAY_VIDEO ||
         !raop->airplay_video[raop->current_video]) {
-        logger_log(raop->logger, LOGGER_ERR, "hls_get_current_video: failed to identify current_playlist");
+        logger_log(raop->logger, LOGGER_DEBUG, "hls_get_current_video: no current playlist");
         return NULL;
     }
     return (void *) raop->airplay_video[raop->current_video];
@@ -447,7 +447,25 @@ http_handler_set_property(raop_conn_t *conn,
     } else if (!strcmp(property, "reverseEndTime") ||
         !strcmp(property, "forwardEndTime") ||
         !strcmp(property, "actionAtItemEnd")) {
-        logger_log(raop->logger, LOGGER_DEBUG, "property %s is known but unhandled", property);
+        if (!strcmp(property, "actionAtItemEnd") && airplay_video) {
+            int request_datalen = 0;
+            const char *request_data = http_request_get_data(request, &request_datalen);
+            plist_t req_root_node = NULL;
+            if (request_data && request_datalen > 8 && !memcmp(request_data, "bplist00", 8)) {
+                plist_from_bin(request_data, request_datalen, &req_root_node);
+            }
+            plist_t value_node = req_root_node && PLIST_IS_DICT(req_root_node)
+                ? plist_dict_get_item(req_root_node, "value") : NULL;
+            if (value_node && PLIST_IS_UINT(value_node)) {
+                uint64_t action = 0;
+                plist_get_uint_val(value_node, &action);
+                set_action_at_item_end(airplay_video, (int) action);
+                logger_log(raop->logger, LOGGER_DEBUG, "actionAtItemEnd = %d", (int) action);
+            }
+            if (req_root_node) plist_free(req_root_node);
+        } else {
+            logger_log(raop->logger, LOGGER_DEBUG, "property %s is known but unhandled", property);
+        }
 
         plist_t errResponse = plist_new_dict();
         plist_t errCode = plist_new_uint(0);
@@ -570,12 +588,31 @@ http_handler_playback_info(raop_conn_t *conn, http_request_t *request, http_resp
     playback_info_t playback_info;
 
     playback_info.stallcount = 0;
+    playback_info.ended = false;
     //playback_info.playback_buffer_empty = false;   // maybe  need to get this from playbin 
     //playback_info.playback_buffer_full = true;
     //ayback_info.ready_to_play = true; // ???;
     //ayback_info.playback_likely_to_keep_up = true;
 
     raop->callbacks.on_video_acquire_playback_info(raop->callbacks.cls, &playback_info);
+    if (playback_info.ended) {
+        airplay_video_t *current = raop->current_video >= 0 && raop->current_video < MAX_AIRPLAY_VIDEO
+            ? raop->airplay_video[raop->current_video] : NULL;
+        const int action = get_action_at_item_end(current);
+        if ((action == 1 || action == 2) && playback_info.duration > 0.0) {
+            /* The sender asked for the item to stay paused at its end (as an
+               Apple TV does), so keep the session and report the end
+               position instead of shutting the connection down. */
+            playback_info.position = playback_info.duration;
+            playback_info.rate = 0.0f;
+            playback_info.ready_to_play = true;
+            playback_info.playback_buffer_empty = false;
+            playback_info.playback_buffer_full = true;
+            playback_info.playback_likely_to_keep_up = true;
+        } else {
+            playback_info.duration = -1.0;
+        }
+    }
     if (playback_info.duration == -1.0) {
         /* video has finished, reset */
         logger_log(raop->logger, LOGGER_DEBUG, "playback_info not available (finishing)");
@@ -638,6 +675,7 @@ http_handler_reverse(raop_conn_t *conn, http_request_t *request, http_response_t
                upgrade ? upgrade : "(missing)", purpose ? purpose : "(missing)");
 
     httpd_set_connection_type(raop->httpd, (void *) conn, CONNECTION_TYPE_PTTH);
+    conn->connection_type = CONNECTION_TYPE_PTTH;
     int type_PTTH = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_PTTH);
 
     if (type_PTTH == 1) {
@@ -650,10 +688,54 @@ http_handler_reverse(raop_conn_t *conn, http_request_t *request, http_response_t
     }    
 }
 
+/* The sender can deliver /play before it upgrades the connection used for
+   reverse HTTP.  Keep the stateful local-media request on the current
+   playlist and send it after the 101 response has reached the sender. */
+static void
+http_send_pending_reverse_media(raop_conn_t *conn) {
+    if (!conn || !conn->raop) return;
+    raop_t *raop = conn->raop;
+    if (raop->current_video < 0 || raop->current_video >= MAX_AIRPLAY_VIDEO ||
+        !raop->airplay_video[raop->current_video]) {
+        return;
+    }
+
+    airplay_video_t *airplay_video = raop->airplay_video[raop->current_video];
+    if (!get_reverse_media_pending(airplay_video) ||
+        get_reverse_media_request_sent(airplay_video)) {
+        return;
+    }
+
+    const char *media_url = get_playback_location(airplay_video);
+    const char *session_id = get_apple_session_id(airplay_video);
+    const int request_id = get_reverse_media_request_id(airplay_video);
+    if (!media_url || !*media_url || !session_id || !*session_id || request_id <= 0) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] queued reverse-fetch request is incomplete; keeping playlist pending");
+        return;
+    }
+
+    if (fcup_request((void *) conn, media_url, session_id, request_id) < 0) {
+        logger_log(raop->logger, LOGGER_WARNING,
+                   "[MEDIA] reverse-fetch request remains queued after PTTH send failure "
+                   "(request_id=%d)", request_id);
+        return;
+    }
+
+    set_reverse_media_request_sent(airplay_video, true);
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] sent queued sender-local media reverse-fetch request "
+               "(request_id=%d)", request_id);
+}
+
 /* POST /action returns the payload requested by a preceding FCUP request on
    the reverse channel. Historically this was limited to HLS playlists. Safari
-   can also advertise a page-local blob URL, for which we experimentally ask
-   the sender to return the bounded ISO-BMFF media object itself. */
+   can also advertise page-local blob: URLs, and native media apps can expose
+   sender-local file: URLs. In both cases the receiver must ask the sender for
+   the bytes; the path in a file: URL is not meaningful on this host. */
+
+static void http_play_item(raop_conn_t *conn, http_response_t *response,
+                           const char *apple_session_id, plist_t req_root_node);
 
 static void
 http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t *response,
@@ -677,13 +759,14 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         logger_log(raop->logger, LOGGER_ERR, "Play request had no X-Apple-Session-ID");
         goto post_action_error;
     }    
-    if (!airplay_video) {
+    /* playlistRemove/playlistInsert may arrive while no item is current (an
+       AVPlayer replacing its item removes the old one first); they are
+       checked against the connection's session instead. */
+    const char *apple_session_id = airplay_video ? get_apple_session_id(airplay_video)
+                                                 : conn->client_session_id;
+    if (!apple_session_id) {
         logger_log(raop->logger, LOGGER_ERR,
                    "[MEDIA] POST /action arrived before a valid POST /play");
-        goto post_action_error;
-    }
-    const char *apple_session_id = get_apple_session_id(airplay_video);
-    if (!apple_session_id) {
         goto post_action_error;
     }
     if (strcmp(session_id, apple_session_id)){
@@ -747,6 +830,11 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     if (!PLIST_IS_DICT (req_params_node)) {
         goto post_action_error;
     }
+    if (!airplay_video && strcmp(type, "playlistRemove") && strcmp(type, "playlistInsert")) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] POST /action %s arrived before a valid POST /play", type);
+        goto post_action_error;
+    }
     if (!strcmp(type,"playlistRemove")) {
         plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
         if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
@@ -761,7 +849,9 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             goto post_action_error;
         }
         int id  =  get_playlist_by_uuid(raop, remove_uuid);
-        if (id == raop->current_video) {
+        if (airplay_video && id == raop->current_video) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] playlistRemove: current item removed (holding last frame)");
             raop->current_video = -1;
             float position = raop->callbacks.on_video_playlist_remove(raop->callbacks.cls);
             /* keep the playlist (until space is needed for another one) in case its playback_uuid is re-requested
@@ -773,31 +863,16 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         plist_mem_free (remove_uuid);
 
     } else if (!strcmp(type, "playlistInsert")) {
-        logger_log(raop->logger, LOGGER_INFO, "action type playlistInsert (start playback)");
         plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
         if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
+            logger_log(raop->logger, LOGGER_ERR, "[MEDIA] playlistInsert without an item dictionary");
             goto post_action_error;
         }
-        plist_t req_params_item_uuid_node = plist_dict_get_item(req_params_item_node, "uuid");
-        char* remove_uuid = NULL;
-        if (PLIST_IS_STRING(req_params_item_uuid_node)) {
-            plist_get_string_val(req_params_item_uuid_node, &remove_uuid);
-        }
-        if (remove_uuid) {
-            int id  =  get_playlist_by_uuid(raop, remove_uuid);
-            if (id >= 0) {
-                logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s is stored at airplay_video[%d]", remove_uuid, id);
-            } else {
-                logger_log(raop->logger, LOGGER_INFO, "playlistInsert uuid %s is not a stored playlist", remove_uuid);
-            }
-            plist_mem_free(remove_uuid);
-            char *plist_xml = NULL;
-            uint32_t plist_len = 0;
-            plist_to_xml(req_params_item_node, &plist_xml, &plist_len);
-            printf("playlistInsert parameter item list is:\n%s", plist_xml);
-            plist_mem_free(plist_xml);
-        }
-        logger_log(raop->logger, LOGGER_ERR, "FIXME: playlistInsert is not yet implemented");
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] playlistInsert: sender replaced its current item; playing the new item");
+        /* the item has the same keys as a POST /play body */
+        http_play_item(conn, response, session_id, plist_copy(req_params_item_node));
+        goto post_action_success;
 
     } else if (!strcmp(type, "unhandledURLResponse")) {   
         /* handling type "unhandledURLResponse" */
@@ -816,15 +891,13 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
                    "[MEDIA] reverse fetch response status_present=%d status=%d",
                    fcup_response_status_present, fcup_response_statuscode);
 
-        if  (logger_debug) {
-            plist_t req_params_fcup_response_requestid_node = plist_dict_get_item(req_params_node,
-                                                                     "FCUP_Response_RequestID");
-            if (req_params_fcup_response_requestid_node) {
-                plist_get_uint_val(req_params_fcup_response_requestid_node, &uint_val);
-                request_id = (int) uint_val;
-                uint_val = 0;
-                logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_RequestID =  %d", request_id);
-            }
+        plist_t req_params_fcup_response_requestid_node = plist_dict_get_item(req_params_node,
+                                                                 "FCUP_Response_RequestID");
+        if (req_params_fcup_response_requestid_node) {
+            plist_get_uint_val(req_params_fcup_response_requestid_node, &uint_val);
+            request_id = (int) uint_val;
+            uint_val = 0;
+            logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_RequestID =  %d", request_id);
         }
 
         plist_t req_params_fcup_response_url_node = plist_dict_get_item(req_params_node, "FCUP_Response_URL");
@@ -852,8 +925,9 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         fcup_response_data = plist_get_data_val(req_params_fcup_response_data_node, &fcup_response_data, &uint_val);
 #endif
         fcup_response_datalen = (int) uint_val;
-        logger_log(raop->logger, LOGGER_INFO, "[MEDIA] received reverse-fetched payload (%d bytes)",
-                   fcup_response_datalen);
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] received reverse-fetch reply (request_id=%d, bytes=%d)",
+                   request_id, fcup_response_datalen);
         if (!fcup_response_data) {
             plist_mem_free(fcup_response_url);
             goto post_action_error;
@@ -863,7 +937,20 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             const char *requested_url = get_playback_location(airplay_video);
             const bool url_matches = requested_url &&
                 !strcmp(requested_url, fcup_response_url);
-            /* Safari uses 0 when no HTTP status applies to a page-local blob. */
+            const int expected_request_id = get_reverse_media_request_id(airplay_video);
+            const bool request_id_matches = request_id <= 0 || expected_request_id <= 0 ||
+                request_id == expected_request_id;
+            if (!request_id_matches) {
+                /* Request IDs are commonly scoped to each playlist. Keep the
+                   mismatch visible, but do not reject an otherwise matching
+                   sender response. */
+                logger_log(raop->logger, LOGGER_WARNING,
+                           "[MEDIA] reverse-fetch reply request ID differs "
+                           "(reply=%d expected=%d); accepting URL-matched response",
+                           request_id, expected_request_id);
+            }
+            /* Some Apple senders use 0 when no HTTP status applies to a
+               sender-local reverse fetch. */
             const bool status_ok = !fcup_response_status_present ||
                 fcup_response_statuscode == 0 ||
                 (fcup_response_statuscode >= 200 && fcup_response_statuscode < 300);
@@ -884,10 +971,12 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 
             if (!url_matches || !status_ok || !size_ok || !format_ok || !spooled_path) {
                 logger_log(raop->logger, LOGGER_ERR,
-                           "[MEDIA] reverse blob fetch unusable "
-                           "(url_match=%d status_present=%d status=%d status_ok=%d "
+                           "[MEDIA] reverse sender-local media fetch unusable "
+                           "(url_match=%d request_id=%d expected=%d request_id_ok=%d "
+                           "status_present=%d status=%d status_ok=%d "
                            "bytes=%d iso_bmff=%d spool_attempted=%d spool=%d)",
-                           url_matches, fcup_response_status_present,
+                           url_matches, request_id, expected_request_id, request_id_matches,
+                           fcup_response_status_present,
                            fcup_response_statuscode, status_ok, fcup_response_datalen,
                            format_ok, spool_attempted, spooled_path != NULL);
                 free(spooled_path);
@@ -912,8 +1001,10 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             }
             set_playback_location(airplay_video, spooled_path, strlen(spooled_path));
             set_reverse_media_pending(airplay_video, false);
+            set_reverse_media_request_sent(airplay_video, false);
             logger_log(raop->logger, LOGGER_INFO,
-                       "[MEDIA] reverse-fetched blob spooled securely (%d bytes); starting playback",
+                       "[MEDIA] reverse-fetched sender-local media spooled securely "
+                       "(%d bytes); starting playback",
                        fcup_response_datalen);
             raop->callbacks.on_video_play(raop->callbacks.cls,
                                           get_playback_location(airplay_video),
@@ -1025,6 +1116,19 @@ media_location_is_blob(const char *location) {
     return location && !strncasecmp(location, "blob:", 5);
 }
 
+static bool
+media_location_is_file(const char *location) {
+    return location && !strncasecmp(location, "file:", 5);
+}
+
+/* A reverse-fetchable URL is a locator in the sender's process. It must never
+   be handed directly to the receiver-side media player because a file: path
+   would then be resolved against the Mac's filesystem. */
+static bool
+media_location_is_reverse_fetchable(const char *location) {
+    return media_location_is_blob(location) || media_location_is_file(location);
+}
+
 static void
 media_location_scheme(const char *location, char *scheme, size_t scheme_size) {
     if (!scheme || scheme_size == 0) return;
@@ -1088,92 +1192,124 @@ play_text_parameter(const char *data, int datalen, const char *name) {
     return NULL;
 }
 
+/* iOS AVPlayer AirPlay of a local file (mediaType "file") carries no
+   Content-Location.  Instead the sender serves the file from its own HTTP
+   server and describes it with "host" ("[fe80::...]:7001" or "a.b.c.d:port")
+   and "path" ("/1/<id>.mp4").  Build an http:// URL for it.  The address is
+   always the one this connection comes from, so the receiver never fetches
+   from a third host, and link-local IPv6 gets the interface zone that the
+   advertised host omits.  Returns a malloc'd URL or NULL. */
+static char *
+play_sender_hosted_location(raop_conn_t *conn, plist_t req_root_node) {
+    raop_t *raop = conn->raop;
+    plist_t host_node = plist_dict_get_item(req_root_node, "host");
+    plist_t path_node = plist_dict_get_item(req_root_node, "path");
+    if (!host_node || !path_node || !PLIST_IS_STRING(host_node) || !PLIST_IS_STRING(path_node)) {
+        return NULL;
+    }
+    const char *host = plist_get_string_ptr(host_node, NULL);
+    const char *path = plist_get_string_ptr(path_node, NULL);
+    if (!host || !path || path[0] != '/') {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] sender-hosted POST /play has an invalid host/path");
+        return NULL;
+    }
+    for (const char *c = path; *c; c++) {
+        if ((unsigned char) *c <= 0x20 || *c == 0x7f || *c == '#') {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "[MEDIA] sender-hosted POST /play path contains unsupported characters");
+            return NULL;
+        }
+    }
+
+    /* split "host" into address and port */
+    char advertised[64] = {0};
+    const char *port = NULL;
+    if (host[0] == '[') {
+        const char *end = strchr(host, ']');
+        if (!end || (size_t) (end - host - 1) >= sizeof(advertised)) return NULL;
+        memcpy(advertised, host + 1, (size_t) (end - host - 1));
+        if (end[1] == ':') port = end + 2;
+    } else {
+        const char *colon = strrchr(host, ':');
+        const bool single_colon = colon && colon == strchr(host, ':');
+        size_t len = single_colon ? (size_t) (colon - host) : strlen(host);
+        if (len >= sizeof(advertised)) return NULL;
+        memcpy(advertised, host, len);
+        if (single_colon) port = colon + 1;
+    }
+    long port_value = 80;
+    if (port && *port) {
+        char *end = NULL;
+        port_value = strtol(port, &end, 10);
+        if (!end || *end || port_value <= 0 || port_value > 65535) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "[MEDIA] sender-hosted POST /play host has an invalid port");
+            return NULL;
+        }
+    }
+
+    char remote[64] = {0};
+    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id,
+                              remote, (int) sizeof(remote));
+    if (!remote[0]) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] sender-hosted POST /play: sender address unavailable");
+        return NULL;
+    }
+    char remote_plain[64];
+    snprintf(remote_plain, sizeof(remote_plain), "%s", remote);
+    char *zone = strchr(remote_plain, '%');
+    if (zone) *zone = '\0';
+    if (advertised[0] && strcasecmp(advertised, remote_plain)) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] sender-hosted media advertised on %s; using the connection "
+                   "address %s", advertised, remote);
+    }
+
+    const bool ipv6 = strchr(remote, ':') != NULL;
+    size_t len = strlen(remote) + strlen(path) + 32;
+    char *url = calloc(len, 1);
+    if (!url) return NULL;
+    snprintf(url, len, "http://%s%s%s:%ld%s", ipv6 ? "[" : "", remote, ipv6 ? "]" : "",
+             port_value, path);
+    return url;
+}
+
+/* Handles one media item: the body of POST /play, or the item of a
+   POST /action playlistInsert (AVPlayer replacing its current item sends
+   playlistRemove + playlistInsert instead of a new /play).  Takes ownership
+   of req_root_node. */
 static void
-http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *response,
-                      char **response_data, int *response_datalen) {
+http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_session_id,
+               plist_t req_root_node) {
     raop_t *raop = conn->raop;
     char* playback_location = NULL;
     char* client_proc_name = NULL;
-    plist_t req_root_node = NULL;
     float start_position_seconds = 0.0f;
-    bool data_is_binary_plist = false;
     airplay_video_t *airplay_video = NULL;
     int id = -1;
     bool created_airplay_video = false;
     bool playback_stopped = false;
-    
-    logger_log(raop->logger, LOGGER_DEBUG, "http_handler_play");
+    bool sender_hosted = false;
 
-    int request_datalen = -1;
-    const char *request_data = http_request_get_data(request, &request_datalen);
-    const char *content_type = http_request_get_header(request, "Content-Type");
-    const char *apple_session_id = http_request_get_header(request, "X-Apple-Session-ID");
-    const bool data_is_text_parameters =
-        header_value_contains(content_type, "text/parameters");
 
-    logger_log(raop->logger, LOGGER_INFO,
-               "[MEDIA] POST /play received (session=%s, body=%d bytes)",
-               apple_session_id ? apple_session_id : "(missing)", request_datalen);
-
-    if (data_is_text_parameters) {
-        playback_location = play_text_parameter(request_data, request_datalen,
-                                                "Content-Location");
-        if (!playback_location) {
-            const char *header_location = http_request_get_header(request, "Content-Location");
-            if (header_location) playback_location = strdup(header_location);
+    if (!plist_dict_get_item(req_root_node, "Content-Location")) {
+        char *hosted = play_sender_hosted_location(conn, req_root_node);
+        if (hosted) {
+            plist_t media_type_node = plist_dict_get_item(req_root_node, "mediaType");
+            const char *media_type = media_type_node && PLIST_IS_STRING(media_type_node)
+                ? plist_get_string_ptr(media_type_node, NULL) : NULL;
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] POST /play is sender-hosted media (mediaType=%s); "
+                       "fetching it from the sender's media server",
+                       media_type ? media_type : "(unspecified)");
+            logger_log(raop->logger, raop->media_trace_level,
+                       "[MEDIA-TRACE] sender-hosted media URL: %s", hosted);
+            plist_dict_set_item(req_root_node, "Content-Location", plist_new_string(hosted));
+            free(hosted);
+            sender_hosted = true;
         }
-        char *start_value = play_text_parameter(request_data, request_datalen,
-                                                "Start-Position-Seconds");
-        if (!start_value) {
-            start_value = play_text_parameter(request_data, request_datalen,
-                                              "Start-Position");
-        }
-        if (!start_value) {
-            const char *header_start = http_request_get_header(request, "Start-Position");
-            if (header_start) start_value = strdup(header_start);
-        }
-        if (start_value) {
-            char *end = NULL;
-            const float parsed = strtof(start_value, &end);
-            if (end && end != start_value) start_position_seconds = parsed;
-            free(start_value);
-        }
-        if (!media_location_is_http(playback_location)) {
-            char scheme[16];
-            media_location_scheme(playback_location, scheme, sizeof(scheme));
-            logger_log(raop->logger, LOGGER_ERR,
-                       "[MEDIA] classic POST /play rejected Content-Location "
-                       "scheme=%s length=%zu (only HTTP(S) is supported)",
-                       scheme, playback_location ? strlen(playback_location) : 0);
-            goto play_error;
-        }
-        logger_log(raop->logger, LOGGER_INFO,
-                   "[MEDIA] parsed classic text/parameters play request (start=%.3fs)",
-                   start_position_seconds);
-        raop->callbacks.on_video_play(raop->callbacks.cls, playback_location,
-                                      start_position_seconds);
-        free(playback_location);
-        return;
-    }
-
-    if (!apple_session_id) {
-        logger_log(raop->logger, LOGGER_ERR, "Play request had no X-Apple-Session-ID");
-        goto play_error;
-    }
-
-    if (request_datalen > 0) {
-        data_is_binary_plist =
-            header_value_contains(content_type, "x-apple-binary-plist");
-    }
-
-    if (!data_is_binary_plist) {
-         logger_log(raop->logger, LOGGER_ERR, "Play request Content is not binary_plist (unsupported)");
-         goto play_error;
-    }
-
-    plist_from_bin(request_data, request_datalen, &req_root_node);
-    if (!req_root_node || !PLIST_IS_DICT(req_root_node)) {
-        goto play_error;
     }
 
     plist_t req_uuid_node = plist_dict_get_item(req_root_node, "uuid");
@@ -1237,6 +1373,13 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         if (!media_location_is_http(stored_location) && !stored_is_spooled) {
             logger_log(raop->logger, LOGGER_ERR,
                        "[MEDIA] discarding incomplete stored playlist before replay");
+            raop_destroy_airplay_video(raop, id);
+            id = -1;
+        } else if (sender_hosted) {
+            /* The sender's media server URL and requested position are only
+               valid for this request; never resume from a stored copy. */
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] replacing stored item for repeated sender-hosted POST /play");
             raop_destroy_airplay_video(raop, id);
             id = -1;
         } else {
@@ -1311,6 +1454,8 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
 	   
     plist_t req_content_location_node = plist_dict_get_item(req_root_node, "Content-Location");
     if (!req_content_location_node) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] stateful POST /play (uuid present) has no Content-Location key");
         goto play_error;
     } else {
         plist_get_string_val(req_content_location_node, &playback_location);
@@ -1321,7 +1466,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         goto play_error;
     }
     if (!media_location_is_http(playback_location) &&
-        media_location_is_blob(playback_location)) {
+        media_location_is_reverse_fetchable(playback_location)) {
         plist_t start_node = plist_dict_get_item(req_root_node,
                                                   "Start-Position-Seconds");
         if (start_node) {
@@ -1333,22 +1478,34 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         set_playback_location(airplay_video, playback_location,
                               strlen(playback_location));
         set_reverse_media_pending(airplay_video, true);
+        const int reverse_request_id = get_next_FCUP_RequestID(airplay_video);
+        set_reverse_media_request_id(airplay_video, reverse_request_id);
+        set_reverse_media_request_sent(airplay_video, false);
 
-        /* A page-local blob cannot be fetched by FFmpeg. Ask Safari to fetch
-           it in the originating process and return the response bytes over
-           the already-established PTTH reverse channel. */
+        /* A sender-local URL cannot be fetched by FFmpeg. Ask the sender to
+           resolve it in the originating process and return the response bytes
+           over the PTTH reverse channel. The sender is allowed to establish
+           that channel after POST /play, so keep this playlist alive until
+           the 101 response has been sent. */
         raop->callbacks.on_video_stop(raop->callbacks.cls);
         playback_stopped = true;
-        const int reverse_result = fcup_request((void *) conn, playback_location,
-                                                apple_session_id,
-                                                get_next_FCUP_RequestID(airplay_video));
-        if (reverse_result < 0) {
-            logger_log(raop->logger, LOGGER_ERR,
-                       "[MEDIA] Safari blob reverse-fetch request could not be sent");
-            goto play_error;
+        if (httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_PTTH) == 0) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] queued sender-local media reverse-fetch request "
+                       "until PTTH is established (request_id=%d)", reverse_request_id);
+        } else if (fcup_request((void *) conn, playback_location,
+                                apple_session_id, reverse_request_id) < 0) {
+            logger_log(raop->logger, LOGGER_WARNING,
+                       "[MEDIA] queued sender-local media reverse-fetch request "
+                       "after PTTH send failure (request_id=%d)", reverse_request_id);
+        } else {
+            set_reverse_media_request_sent(airplay_video, true);
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] sent sender-local media reverse-fetch request "
+                       "(request_id=%d)", reverse_request_id);
         }
         logger_log(raop->logger, LOGGER_INFO,
-                   "[MEDIA] requested page-local blob over reverse channel "
+                   "[MEDIA] sender-local media request retained "
                    "(length=%zu, limit=%u MiB)",
                    strlen(playback_location), MAX_FCUP_MEDIA_BYTES / (1024U * 1024U));
         plist_mem_free(playback_location);
@@ -1360,7 +1517,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         media_location_scheme(playback_location, scheme, sizeof(scheme));
         logger_log(raop->logger, LOGGER_ERR,
                    "[MEDIA] POST /play rejected Content-Location scheme=%s "
-                   "length=%zu (only HTTP(S) is supported)",
+                   "length=%zu (only HTTP(S) and supported reverse-fetch URLs are supported)",
                    scheme, strlen(playback_location));
         goto play_error;
     }
@@ -1402,6 +1559,16 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         raop->callbacks.on_video_play(raop->callbacks.cls,
                                       get_playback_location(airplay_video),
                                       get_start_position_seconds(airplay_video));
+        /* AVPlayer senders put the initial rate in the /play body; honour a
+           paused start (the player itself starts at rate 1). */
+        plist_t req_rate_node = plist_dict_get_item(req_root_node, "rate");
+        if (req_rate_node && PLIST_IS_REAL(req_rate_node)) {
+            double rate = 1.0;
+            plist_get_real_val(req_rate_node, &rate);
+            if (rate <= 0.0) {
+                raop->callbacks.on_video_rate(raop->callbacks.cls, 0.0f);
+            }
+        }
     } else {
         size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(uri_suffix);
         char *location = (char *) calloc(len + 1, sizeof(char));
@@ -1462,9 +1629,133 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     if (req_root_node) {
         plist_free(req_root_node);
     }
-    logger_log(raop->logger, LOGGER_ERR, "Could not find valid Plist Data for POST/play request, Unhandled");
+    logger_log(raop->logger, LOGGER_ERR,
+               "[MEDIA] POST /play could not be handled; answering 400 and keeping the "
+               "AirPlay session open so the sender can fall back");
+    /* Never disconnect here: tearing down the connection makes iOS abandon the
+       whole AirPlay session (including screen mirroring) instead of falling
+       back to it. */
     http_response_init(response, "HTTP/1.1", 400, "Bad Request");
-    http_response_set_disconnect(response, 1);
+}
+
+static void
+http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *response,
+                      char **response_data, int *response_datalen) {
+    raop_t *raop = conn->raop;
+    char* playback_location = NULL;
+    char* client_proc_name = NULL;
+    plist_t req_root_node = NULL;
+    float start_position_seconds = 0.0f;
+    bool data_is_binary_plist = false;
+    airplay_video_t *airplay_video = NULL;
+    int id = -1;
+    bool created_airplay_video = false;
+    bool playback_stopped = false;
+    bool sender_hosted = false;
+    
+    logger_log(raop->logger, LOGGER_DEBUG, "http_handler_play");
+
+    int request_datalen = -1;
+    const char *request_data = http_request_get_data(request, &request_datalen);
+    const char *content_type = http_request_get_header(request, "Content-Type");
+    const char *apple_session_id = http_request_get_header(request, "X-Apple-Session-ID");
+    const bool data_is_text_parameters =
+        header_value_contains(content_type, "text/parameters");
+
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] POST /play received (session=%s, body=%d bytes)",
+               apple_session_id ? apple_session_id : "(missing)", request_datalen);
+
+    if (data_is_text_parameters) {
+        playback_location = play_text_parameter(request_data, request_datalen,
+                                                "Content-Location");
+        if (!playback_location) {
+            const char *header_location = http_request_get_header(request, "Content-Location");
+            if (header_location) playback_location = strdup(header_location);
+        }
+        char *start_value = play_text_parameter(request_data, request_datalen,
+                                                "Start-Position-Seconds");
+        if (!start_value) {
+            start_value = play_text_parameter(request_data, request_datalen,
+                                              "Start-Position");
+        }
+        if (!start_value) {
+            const char *header_start = http_request_get_header(request, "Start-Position");
+            if (header_start) start_value = strdup(header_start);
+        }
+        if (start_value) {
+            char *end = NULL;
+            const float parsed = strtof(start_value, &end);
+            if (end && end != start_value) start_position_seconds = parsed;
+            free(start_value);
+        }
+        if (!media_location_is_http(playback_location)) {
+            char scheme[16];
+            media_location_scheme(playback_location, scheme, sizeof(scheme));
+            logger_log(raop->logger, LOGGER_ERR,
+                       "[MEDIA] classic POST /play rejected Content-Location "
+                       "scheme=%s length=%zu (only HTTP(S) is supported)",
+                       scheme, playback_location ? strlen(playback_location) : 0);
+            goto play_error;
+        }
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] parsed classic text/parameters play request (start=%.3fs)",
+                   start_position_seconds);
+        raop->callbacks.on_video_play(raop->callbacks.cls, playback_location,
+                                      start_position_seconds);
+        free(playback_location);
+        return;
+    }
+
+    if (!apple_session_id) {
+        logger_log(raop->logger, LOGGER_ERR, "Play request had no X-Apple-Session-ID");
+        goto play_error;
+    }
+
+    if (request_datalen > 0) {
+        data_is_binary_plist =
+            header_value_contains(content_type, "x-apple-binary-plist");
+    }
+
+    if (!data_is_binary_plist) {
+         logger_log(raop->logger, LOGGER_ERR, "Play request Content is not binary_plist (unsupported)");
+         goto play_error;
+    }
+
+    plist_from_bin(request_data, request_datalen, &req_root_node);
+    if (!req_root_node) {
+        const char *content_length = http_request_get_header(request, "Content-Length");
+        char head[3 * 16 + 1] = {0};
+        for (int i = 0; request_data && i < request_datalen && i < 16; i++) {
+            snprintf(head + 3 * i, sizeof(head) - 3 * i, "%02x ", (unsigned char) request_data[i]);
+        }
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] POST /play binary plist did not parse "
+                   "(Content-Type=%s Content-Length=%s received=%d first bytes: %s)",
+                   content_type ? content_type : "(missing)",
+                   content_length ? content_length : "(missing)", request_datalen, head);
+        goto play_error;
+    }
+    if (!PLIST_IS_DICT(req_root_node)) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] POST /play binary plist root is not a dictionary (type=%d)",
+                   (int) plist_get_node_type(req_root_node));
+        goto play_error;
+    }
+
+    http_play_item(conn, response, apple_session_id, req_root_node);
+    return;
+
+ play_error:;
+    plist_mem_free(playback_location);
+    raop->callbacks.on_video_stop(raop->callbacks.cls);
+    if (req_root_node) {
+        plist_free(req_root_node);
+    }
+    logger_log(raop->logger, LOGGER_ERR,
+               "[MEDIA] POST /play could not be handled; answering 400 and keeping the "
+               "AirPlay session open so the sender can fall back");
+    http_response_init(response, "HTTP/1.1", 400, "Bad Request");
 }
 
 /* the HLS handler handles http requests GET /[uri] on the HLS channel from the media player to the Server, asking for

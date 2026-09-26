@@ -34,6 +34,7 @@ struct httpd_callbacks_s {
     void* (*conn_init)(void *opaque, unsigned char *local, int locallen, unsigned char *remote,
                        int remotelen, unsigned int zone_id);
     void  (*conn_request)(void *ptr, http_request_t *request, http_response_t **response);
+    void  (*conn_response_sent)(void *ptr, http_response_t *response);
     void  (*conn_destroy)(void *ptr);
 };
 typedef struct httpd_callbacks_s httpd_callbacks_t;

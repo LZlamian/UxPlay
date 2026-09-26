@@ -534,6 +534,15 @@ httpd_thread(void *arg)
             if (http_request_is_reverse(connection->request)) {
                 /* this is a response from the client to a
                  * GET /event reverse HTTP request from the server */
+                if (ret > 0 && logger_get_level(httpd->logger) >= LOGGER_INFO) {
+                    /* media trace: first line of the sender's reply to a
+                       reverse-HTTP POST /event (FCUP) request */
+                    const char *eol = memchr(buffer, '\r', (size_t) ret);
+                    logger_log(httpd->logger, LOGGER_INFO,
+                               "[MEDIA-TRACE] <<< PTTH reply on socket %d (%d bytes): %.*s",
+                               connection->socket_fd, ret,
+                               eol ? (int) (eol - buffer) : (ret > 120 ? 120 : ret), buffer);
+                }
                 if (ret && logger_debug) {
                     buffer[ret] = '\0';
                     logger_log(httpd->logger, LOGGER_INFO, "<<<< received response from client"
@@ -592,6 +601,14 @@ httpd_thread(void *arg)
                             break;
                         }
                         written += ret;
+                    }
+
+                    /* Notify protocol owners only after the response bytes are
+                       on the wire.  Reverse HTTP uses this boundary to send
+                       the first PTTH request after the 101 upgrade. */
+                    if (written == datalen && httpd->callbacks.conn_response_sent &&
+                        !http_response_get_disconnect(response)) {
+                        httpd->callbacks.conn_response_sent(connection->user_data, response);
                     }
 
                     if (http_response_get_disconnect(response)) {

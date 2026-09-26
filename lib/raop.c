@@ -92,6 +92,11 @@ struct raop_s {
      * immediately as a compatibility fallback. */
     bool fast_connect;
 
+    /* Log level used for the AirPlay video/media protocol trace
+     * (media_trace.h).  LOGGER_DEBUG by default; hosts raise it to make the
+     * complete /play, /reverse, FCUP and playback-control flow visible. */
+    int media_trace_level;
+
     /* used in digest authentication */
     char *nonce;
     char *random_pw;
@@ -126,6 +131,7 @@ struct raop_conn_s {
 typedef struct raop_conn_s raop_conn_t;
 
 #include "raop_handlers.h"
+#include "media_trace.h"
 #include "http_handlers.h"
 
 static void *
@@ -196,6 +202,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
     raop_conn_t *conn = ptr;
     raop_t *raop = conn->raop;
     bool hls_request = false;
+    bool media_traced = false;
     logger_log(raop->logger, LOGGER_DEBUG, "conn_request");
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
     bool logger_debug_data = (logger_get_level(raop->logger) >= LOGGER_DEBUG_DATA);
@@ -414,6 +421,11 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         assert(!strcmp(client_session_id, conn->client_session_id));
     }
 
+    media_traced = !hls_request && !strcmp(protocol, "HTTP/1.1");
+    if (media_traced) {
+        media_trace_request(conn, request, method, url, protocol);
+    }
+
     logger_log(raop->logger, LOGGER_DEBUG, "Handling request %s with URL %s", method, url);
     if (raop->callbacks.conn_request_timing) {
         raop->callbacks.conn_request_timing(raop->callbacks.cls, method, url, true);
@@ -506,6 +518,9 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         }
     }
     http_response_finish(*response, response_data, response_datalen);
+    if (media_traced) {
+        media_trace_response(conn, *response, method, url, response_data, response_datalen);
+    }
     if (raop->callbacks.conn_request_timing) {
         raop->callbacks.conn_request_timing(raop->callbacks.cls, method, url, false);
     }
@@ -564,10 +579,36 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 }
 
 static void
+conn_response_sent(void *ptr, http_response_t *response) {
+    raop_conn_t *conn = ptr;
+    if (!conn || !response || conn->connection_type != CONNECTION_TYPE_PTTH) {
+        return;
+    }
+    http_send_pending_reverse_media(conn);
+}
+
+static void
 conn_destroy(void *ptr) {
     raop_conn_t *conn = ptr;
     raop_t *raop = conn->raop;
     logger_log(raop->logger, LOGGER_DEBUG, "Destroying connection");
+
+    /* The sender can end AirPlay video by closing its connections without a
+       POST /stop.  When the last AirPlay video connection goes away (it is
+       still counted here), stop URL playback so the output does not keep
+       showing a stale frame. */
+    if (conn->connection_type == CONNECTION_TYPE_AIRPLAY &&
+        httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_AIRPLAY) <= 1 &&
+        raop->callbacks.on_video_stop) {
+        /* (the current item may already have been removed by playlistRemove
+           while its last frame is still held) */
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] AirPlay video connection closed without /stop; stopping URL playback");
+        raop->callbacks.on_video_stop(raop->callbacks.cls);
+        if (raop->current_video >= 0) {
+            raop_destroy_airplay_video(raop, raop->current_video);
+        }
+    }
 
     if (raop->callbacks.conn_destroy) {
         raop->callbacks.conn_destroy(raop->callbacks.cls);
@@ -658,6 +699,7 @@ raop_init(raop_callbacks_t *callbacks) {
 
     raop->hls_support = false;
     raop->fast_connect = false;
+    raop->media_trace_level = LOGGER_DEBUG;
 
     raop->nonce = NULL;
 
@@ -698,6 +740,7 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
     httpd_cbs.opaque = raop;
     httpd_cbs.conn_init = &conn_init;
     httpd_cbs.conn_request = &conn_request;
+    httpd_cbs.conn_response_sent = &conn_response_sent;
     httpd_cbs.conn_destroy = &conn_destroy;
 
     /* Initialize the http daemon, (this will take a copy of httpd_cbs) */
@@ -751,6 +794,12 @@ raop_set_log_level(raop_t *raop, int level) {
     assert(raop);
 
     logger_set_level(raop->logger, level);
+}
+
+void
+raop_set_media_trace_level(raop_t *raop, int level) {
+    assert(raop);
+    raop->media_trace_level = level;
 }
 
 int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {

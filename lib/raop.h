@@ -52,6 +52,9 @@ typedef struct playback_info_s {
     int num_seekable_time_ranges;
     void *loadedTimeRanges;
     void *seekableTimeRanges;
+    /* set by the host when the item has played to its end; duration and
+       position then remain valid (duration == -1 is the legacy form) */
+    bool ended;
 } playback_info_t;
   
 typedef enum video_codec_e {
@@ -126,6 +129,7 @@ void raop_handle_eos(raop_t *raop);
 RAOP_API raop_t *raop_init(raop_callbacks_t *callbacks);
 RAOP_API int raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile);
 RAOP_API void raop_set_log_level(raop_t *raop, int level);
+RAOP_API void raop_set_media_trace_level(raop_t *raop, int level);
 RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls);
 RAOP_API int raop_set_plist(raop_t *raop, const char *plist_item, const int value);
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
