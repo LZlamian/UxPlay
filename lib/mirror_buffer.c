@@ -74,6 +74,15 @@ mirror_buffer_init_aes(mirror_buffer_t *mirror_buffer, const uint64_t *streamCon
     }
 
     // Need to be initialized externally
+    /* A new mirror stream (e.g. iOS resuming screen mirroring on the same
+       RTSP connection after AirPlay video) starts a fresh AES-CTR stream:
+       drop the previous context and any partial block it left behind, or
+       every packet of the new stream is decrypted at the wrong offset. */
+    if (mirror_buffer->aes_ctx) {
+        aes_ctr_destroy(mirror_buffer->aes_ctx);
+    }
+    mirror_buffer->nextDecryptCount = 0;
+    memset(mirror_buffer->og, 0, sizeof(mirror_buffer->og));
     mirror_buffer->aes_ctx = aes_ctr_init(aeskey_video, aesiv_video);
 }
 

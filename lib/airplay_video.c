@@ -54,6 +54,9 @@ struct airplay_video_s {
     char *playback_location;
     char *spooled_media_path;
     bool reverse_media_pending;
+    int reverse_media_request_id;
+    bool reverse_media_request_sent;
+    int action_at_item_end;
     char *language_name;
     char *language_code;
     const char *lang;
@@ -98,6 +101,9 @@ airplay_video_t *airplay_video_init(raop_t *raop, unsigned short http_port, cons
     airplay_video->playback_location = NULL;
     airplay_video->spooled_media_path = NULL;
     airplay_video->reverse_media_pending = false;
+    airplay_video->reverse_media_request_id = 0;
+    airplay_video->reverse_media_request_sent = false;
+    airplay_video->action_at_item_end = -1;
     airplay_video->language_code = NULL;
     airplay_video->language_name = NULL;
     airplay_video->media_data_store = NULL;
@@ -213,6 +219,37 @@ void set_reverse_media_pending(airplay_video_t *airplay_video, bool pending) {
 
 bool get_reverse_media_pending(airplay_video_t *airplay_video) {
     return airplay_video && airplay_video->reverse_media_pending;
+}
+
+/* PUT /setProperty?actionAtItemEnd: 0 advance, 1 pause, 2 none; -1 unset */
+void set_action_at_item_end(airplay_video_t *airplay_video, int action) {
+    if (airplay_video) {
+        airplay_video->action_at_item_end = action;
+    }
+}
+
+int get_action_at_item_end(airplay_video_t *airplay_video) {
+    return airplay_video ? airplay_video->action_at_item_end : -1;
+}
+
+void set_reverse_media_request_id(airplay_video_t *airplay_video, int request_id) {
+    if (airplay_video) {
+        airplay_video->reverse_media_request_id = request_id;
+    }
+}
+
+int get_reverse_media_request_id(airplay_video_t *airplay_video) {
+    return airplay_video ? airplay_video->reverse_media_request_id : 0;
+}
+
+void set_reverse_media_request_sent(airplay_video_t *airplay_video, bool sent) {
+    if (airplay_video) {
+        airplay_video->reverse_media_request_sent = sent;
+    }
+}
+
+bool get_reverse_media_request_sent(airplay_video_t *airplay_video) {
+    return airplay_video && airplay_video->reverse_media_request_sent;
 }
 
 bool set_spooled_media_path(airplay_video_t *airplay_video, const char *path, size_t len) {
