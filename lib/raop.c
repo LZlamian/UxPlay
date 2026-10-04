@@ -609,9 +609,9 @@ conn_destroy(void *ptr) {
         logger_log(raop->logger, LOGGER_INFO,
                    "[MEDIA] AirPlay video connection closed without /stop; stopping URL playback");
         raop->callbacks.on_video_stop(raop->callbacks.cls);
-        if (raop->current_video >= 0) {
-            raop_destroy_airplay_video(raop, raop->current_video);
-        }
+        /* The session is over: release every playlist item, including ones
+           no longer current (playlistRemove), and their spooled media. */
+        raop_destroy_airplay_video(raop, -1);
     }
 
     if (raop->callbacks.conn_destroy) {
@@ -717,6 +717,8 @@ int
 raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile) {
     pairing_t *pairing = NULL;
     httpd_t *httpd = NULL;
+
+    sweep_stale_spool_files(raop);
 
     /* create a new public key for pairing */
     int new_key = 0;

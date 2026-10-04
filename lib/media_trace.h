@@ -191,11 +191,17 @@ media_trace_append_plist(media_trace_buf_t *b, plist_t node, int depth) {
         break;
     }
     case PLIST_DATA: {
-        char *data = NULL;
         uint64_t len = 0;
+#ifdef PLIST_210
+        /* only a few bytes are printed: do not copy a media-sized blob */
+        const char *data = plist_get_data_ptr(node, &len);
+        media_trace_append_data(b, data, len, depth);
+#else
+        char *data = NULL;
         plist_get_data_val(node, &data, &len);
         media_trace_append_data(b, data, len, depth);
         plist_mem_free(data);
+#endif
         break;
     }
     case PLIST_UID: {
@@ -337,9 +343,16 @@ media_trace_response(raop_conn_t *conn, http_response_t *response, const char *m
     media_trace_append(&b, "%s %s -> %.*s disconnect=%d", method, url,
                        raw ? (int) (eol ? eol - raw : (len > 80 ? 80 : len)) : 0, raw ? raw : "",
                        http_response_get_disconnect(response));
+    /* the response buffer is not NUL-terminated: search a bounded copy of
+       its header part */
     const char *ct = NULL;
-    if (raw && strstr(raw, "apple-binary-plist")) ct = "application/x-apple-binary-plist";
-    else if (raw && strstr(raw, "plist+xml")) ct = "text/x-apple-plist+xml";
+    char head[512];
+    const size_t head_len = raw && len > 0
+        ? ((size_t) len < sizeof(head) - 1 ? (size_t) len : sizeof(head) - 1) : 0;
+    if (head_len) memcpy(head, raw, head_len);
+    head[head_len] = '\0';
+    if (strstr(head, "apple-binary-plist")) ct = "application/x-apple-binary-plist";
+    else if (strstr(head, "plist+xml")) ct = "text/x-apple-plist+xml";
     media_trace_append_body(&b, ct, response_data, response_datalen);
     media_trace_emit(raop, "<-", &b);
     free(b.buf);

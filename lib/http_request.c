@@ -42,6 +42,7 @@ struct http_request_s {
 
     char *data;
     int datalen;
+    size_t data_capacity;
 
     int complete;
 };
@@ -133,8 +134,25 @@ on_body(llhttp_t *parser, const char *at, size_t length)
         return -1;
     }
 
-    request->data = realloc(request->data, request->datalen + length);
-    assert(request->data);
+    /* The body arrives in pieces of about 1 kB; grow the buffer
+       geometrically rather than once per piece (a sender-hosted media body
+       can be over 100 MB). */
+    size_t needed = (size_t) request->datalen + length;
+    if (needed > request->data_capacity) {
+        size_t capacity = request->data_capacity ? request->data_capacity : 4096;
+        while (capacity < needed) {
+            capacity *= 2;
+        }
+        if (capacity > MAX_HTTP_REQUEST_BODY_BYTES) {
+            capacity = MAX_HTTP_REQUEST_BODY_BYTES;
+        }
+        char *data = realloc(request->data, capacity);
+        if (!data) {
+            return -1;
+        }
+        request->data = data;
+        request->data_capacity = capacity;
+    }
 
     memcpy(request->data+request->datalen, at, length);
     request->datalen += length;
