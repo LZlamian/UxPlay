@@ -76,7 +76,8 @@ int fcup_request(void *conn_opaque, const char *media_url, const char *client_se
 
     int socket_fd = httpd_get_connection_socket_by_type(raop->httpd, CONNECTION_TYPE_PTTH, 1);
 
-    if (socket_fd < 0) {
+    /* the lookup returns 0 when there is no such connection */
+    if (socket_fd <= 0) {
         logger_log(raop->logger, LOGGER_INFO,
                    "[MEDIA] reverse-fetch request deferred: PTTH reverse channel is not ready");
         return -1;

@@ -21,6 +21,7 @@
 #include <stdint.h>
 #include "crypto.h"
 #include "compat.h"
+#include "threads.h"
 #include <math.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -31,6 +32,10 @@
 struct mirror_buffer_s {
     logger_t *logger;
     aes_ctx_t *aes_ctx;
+    /* guards aes_ctx, nextDecryptCount and og: a SETUP for a new mirror
+       stream (httpd thread) replaces them while the mirror thread may be
+       decrypting */
+    mutex_handle_t aes_mutex;
     int nextDecryptCount;
     uint8_t og[16];
     /* audio aes key is used in a hash for the video aes key and iv */
@@ -68,12 +73,14 @@ mirror_buffer_init_aes(mirror_buffer_t *mirror_buffer, const uint64_t *streamCon
        RTSP connection after AirPlay video) starts a fresh AES-CTR stream:
        drop the previous context and any partial block it left behind, or
        every packet of the new stream is decrypted at the wrong offset. */
+    MUTEX_LOCK(mirror_buffer->aes_mutex);
     if (mirror_buffer->aes_ctx) {
         aes_ctr_destroy(mirror_buffer->aes_ctx);
     }
     mirror_buffer->nextDecryptCount = 0;
     memset(mirror_buffer->og, 0, sizeof(mirror_buffer->og));
     mirror_buffer->aes_ctx = aes_ctr_init(aeskey_video, aesiv_video);
+    MUTEX_UNLOCK(mirror_buffer->aes_mutex);
 }
 
 mirror_buffer_t *
@@ -87,10 +94,18 @@ mirror_buffer_init(logger_t *logger, const unsigned char *aeskey)
     memcpy(mirror_buffer->aeskey_audio, aeskey, RAOP_AESKEY_LEN);
     mirror_buffer->logger = logger;
     mirror_buffer->nextDecryptCount = 0;
+    MUTEX_CREATE(mirror_buffer->aes_mutex);
     return mirror_buffer;
 }
 
 void mirror_buffer_decrypt(mirror_buffer_t *mirror_buffer, unsigned char* input, unsigned char* output, int inputLen) {
+    MUTEX_LOCK(mirror_buffer->aes_mutex);
+    if (!mirror_buffer->aes_ctx) {
+        /* no stream key yet (data before SETUP): nothing can be decrypted */
+        MUTEX_UNLOCK(mirror_buffer->aes_mutex);
+        memcpy(output, input, inputLen);
+        return;
+    }
     // Start decrypting
     if (mirror_buffer->nextDecryptCount > 0) {//mirror_buffer->nextDecryptCount = 10
         for (int i = 0; i < mirror_buffer->nextDecryptCount; i++) {
@@ -120,13 +135,17 @@ void mirror_buffer_decrypt(mirror_buffer_t *mirror_buffer, unsigned char* input,
         //outputlength += restlen;
         mirror_buffer->nextDecryptCount = 16 - restlen;// Difference 16-6=10 bytes
     }
+    MUTEX_UNLOCK(mirror_buffer->aes_mutex);
 }
 
 void
 mirror_buffer_destroy(mirror_buffer_t *mirror_buffer)
 {
     if (mirror_buffer) {
-        aes_ctr_destroy(mirror_buffer->aes_ctx);
+        if (mirror_buffer->aes_ctx) {
+            aes_ctr_destroy(mirror_buffer->aes_ctx);
+        }
+        MUTEX_DESTROY(mirror_buffer->aes_mutex);
         free(mirror_buffer);
     }
 }

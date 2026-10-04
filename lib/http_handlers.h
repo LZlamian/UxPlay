@@ -19,11 +19,13 @@
 #include "airplay_video.h"
 #include "fcup_request.h"
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_FCUP_MEDIA_BYTES (128U * 1024U * 1024U)
@@ -105,21 +107,19 @@ same_spool_directory(const char *first, const char *second) {
         !strncmp(first, second, first_length);
 }
 
-static char *
-spool_reverse_media(raop_t *raop, const char *data, size_t size) {
-    if (!data || !size || size > MAX_FCUP_MEDIA_BYTES) {
-        log_spool_failure(raop, "validate", EINVAL);
-        return NULL;
-    }
+#define SPOOL_FILE_PREFIX "obs-airplay-fcup-"
 
-    char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
-    const char *candidates[3] = {NULL, NULL, "/private/tmp"};
+/* The directories a spool file may be created in, in order of preference.
+   user_directory must hold MAX_SPOOL_DIRECTORY_BYTES + 1 bytes. */
+static size_t
+spool_directory_candidates(char *user_directory, const char *candidates[3]) {
     size_t candidate_count = 0;
+    user_directory[0] = '\0';
 #ifdef _CS_DARWIN_USER_TEMP_DIR
     const size_t needed = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
-    if (needed > 1 && needed <= sizeof(user_directory) &&
+    if (needed > 1 && needed <= MAX_SPOOL_DIRECTORY_BYTES + 1U &&
         confstr(_CS_DARWIN_USER_TEMP_DIR, user_directory,
-                sizeof(user_directory)) == needed &&
+                MAX_SPOOL_DIRECTORY_BYTES + 1U) == needed &&
         safe_spool_directory(user_directory)) {
         candidates[candidate_count++] = user_directory;
     }
@@ -134,13 +134,67 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
         !same_spool_directory(candidates[candidate_count - 1], "/private/tmp")) {
         candidates[candidate_count++] = "/private/tmp";
     }
+    return candidate_count;
+}
+
+/* Spool files are removed with their playlist item, but not when the host
+   application crashes. Called once at start-up: removes this user's spool
+   files that are more than a day old (younger ones may belong to another
+   running receiver of the same user). */
+static void
+sweep_stale_spool_files(raop_t *raop) {
+    char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
+    const char *candidates[3] = {NULL, NULL, NULL};
+    const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
+    const time_t now = time(NULL);
+    const time_t stale_seconds = 24 * 60 * 60;
+    int removed = 0;
+
+    for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
+        const char *directory = candidates[candidate];
+        if (!safe_spool_directory(directory)) continue;
+        DIR *listing = opendir(directory);
+        if (!listing) continue;
+        struct dirent *entry;
+        while ((entry = readdir(listing)) != NULL) {
+            if (strncmp(entry->d_name, SPOOL_FILE_PREFIX, strlen(SPOOL_FILE_PREFIX))) continue;
+            char path[SPOOL_PATH_BYTES];
+            const int path_length = snprintf(path, sizeof(path), "%s%s%s", directory,
+                                             directory[strlen(directory) - 1] == '/' ? "" : "/",
+                                             entry->d_name);
+            if (path_length <= 0 || (size_t) path_length >= sizeof(path)) continue;
+            struct stat info;
+            if (lstat(path, &info) != 0 || !S_ISREG(info.st_mode) ||
+                info.st_uid != getuid() || now - info.st_mtime < stale_seconds) {
+                continue;
+            }
+            if (unlink(path) == 0) ++removed;
+        }
+        closedir(listing);
+    }
+    if (removed) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] removed %d stale media spool file(s)", removed);
+    }
+}
+
+static char *
+spool_reverse_media(raop_t *raop, const char *data, size_t size) {
+    if (!data || !size || size > MAX_FCUP_MEDIA_BYTES) {
+        log_spool_failure(raop, "validate", EINVAL);
+        return NULL;
+    }
+
+    char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
+    const char *candidates[3] = {NULL, NULL, NULL};
+    const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
 
     for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
         const char *directory = candidates[candidate];
         if (!safe_spool_directory(directory)) continue;
 
         char path[SPOOL_PATH_BYTES];
-        const int path_length = snprintf(path, sizeof(path), "%s%sobs-airplay-fcup-XXXXXX",
+        const int path_length = snprintf(path, sizeof(path), "%s%s" SPOOL_FILE_PREFIX "XXXXXX",
                                          directory,
                                          directory[strlen(directory) - 1] == '/' ? "" : "/");
         if (path_length <= 0 || (size_t) path_length >= sizeof(path)) {
@@ -329,6 +383,20 @@ http_handler_stop(raop_conn_t *conn, http_request_t *request, http_response_t *r
     logger_log(raop->logger, LOGGER_INFO, "client HTTP request POST stop");
 
     raop->callbacks.on_video_stop(raop->callbacks.cls);
+
+    /* A reverse fetch still under way belongs to the item that was just
+       stopped: its late reply (or a queued request sent on a later PTTH
+       connection) must not start playback again. */
+    if (raop->current_video >= 0 && raop->current_video < MAX_AIRPLAY_VIDEO &&
+        raop->airplay_video[raop->current_video]) {
+        airplay_video_t *airplay_video = raop->airplay_video[raop->current_video];
+        if (get_reverse_media_pending(airplay_video)) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] POST /stop cancelled a pending reverse media fetch");
+            set_reverse_media_pending(airplay_video, false);
+            set_reverse_media_request_sent(airplay_video, false);
+        }
+    }
 }
 
 /* handles PUT /setProperty http requests from Client to Server */
@@ -1014,6 +1082,19 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             goto post_action_success;
         }
 
+        /* Only an HLS item (one with a uri prefix from its /play) expects
+           playlists here. A reply for any other item (a direct URL, or one
+           whose reverse fetch is already done) has nothing to attach to. */
+        if (!get_uri_prefix(airplay_video) || !get_uri_local_prefix(airplay_video)) {
+            logger_log(raop->logger, LOGGER_WARNING,
+                       "[MEDIA] ignoring unexpected reverse-fetch reply for a non-HLS item");
+#ifndef PLIST_210
+            plist_mem_free(fcup_response_data);
+#endif
+            plist_mem_free(fcup_response_url);
+            goto post_action_error;
+        }
+
         char *playlist = (char *) malloc(fcup_response_datalen + 1);
         if (!playlist) {
 #ifndef PLIST_210
@@ -1058,7 +1139,11 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             int uri_num = get_next_media_uri_id(airplay_video);
             --uri_num;    // (next num is current num + 1)
             int ret = store_media_playlist(airplay_video, playlist, &count, &duration, &endlist, uri_num);
-            if (ret == 1) {
+            if (ret < 0) {
+                /* not stored (no such media uri, or it already has a
+                   playlist): the buffer is still ours */
+                free(playlist);
+            } else if (ret == 1) {
                 logger_log(raop->logger, LOGGER_DEBUG,"media_playlist is a duplicate: do not store");
             } else if (count) {
                 logger_log(raop->logger, LOGGER_DEBUG,
