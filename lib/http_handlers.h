@@ -372,6 +372,7 @@ http_handler_rate(raop_conn_t *conn, http_request_t *request, http_response_t *r
             }
         }
     }
+    raop->sender_rate = rate_value;
     raop->callbacks.on_video_rate(raop->callbacks.cls, rate_value);
 }
 
@@ -383,6 +384,7 @@ http_handler_stop(raop_conn_t *conn, http_request_t *request, http_response_t *r
     logger_log(raop->logger, LOGGER_INFO, "client HTTP request POST stop");
 
     raop->callbacks.on_video_stop(raop->callbacks.cls);
+    raop->sender_rate = 1.0f;
 
     /* A reverse fetch still under way belongs to the item that was just
        stopped: its late reply (or a queued request sent on a later PTTH
@@ -1644,15 +1646,22 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         raop->callbacks.on_video_play(raop->callbacks.cls,
                                       get_playback_location(airplay_video),
                                       get_start_position_seconds(airplay_video));
-        /* AVPlayer senders put the initial rate in the /play body; honour a
-           paused start (the player itself starts at rate 1). */
+        /* The host's player starts every item at rate 1.  AVPlayer senders
+           put the initial rate in the /play body.  A playlistInsert item
+           carries none: the sender's player keeps its rate across the item
+           swap and iOS sends no /rate when it has not changed, so the new
+           item takes the rate the sender last asked for.  Either way a
+           paused start shows its first frame and stays there. */
         plist_t req_rate_node = plist_dict_get_item(req_root_node, "rate");
         if (req_rate_node && PLIST_IS_REAL(req_rate_node)) {
             double rate = 1.0;
             plist_get_real_val(req_rate_node, &rate);
-            if (rate <= 0.0) {
-                raop->callbacks.on_video_rate(raop->callbacks.cls, 0.0f);
-            }
+            raop->sender_rate = (float) rate;
+        }
+        if (raop->sender_rate <= 0.0f) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "[MEDIA] new item starts paused (sender rate %.1f)", raop->sender_rate);
+            raop->callbacks.on_video_rate(raop->callbacks.cls, 0.0f);
         }
     } else {
         size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(uri_suffix);
@@ -1828,6 +1837,9 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         goto play_error;
     }
 
+    /* A POST /play starts a new player session: its own "rate" (if any)
+       decides, not a pause left over from an earlier item. */
+    raop->sender_rate = 1.0f;
     http_play_item(conn, response, apple_session_id, req_root_node);
     return;
 

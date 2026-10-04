@@ -97,6 +97,12 @@ struct raop_s {
      * complete /play, /reverse, FCUP and playback-control flow visible. */
     int media_trace_level;
 
+    /* The playback rate the sender's player last asked for (POST /rate, or
+     * the rate in a POST /play body).  The rate belongs to the sender's
+     * player, not to an item: an item swapped in with playlistInsert keeps
+     * it, and iOS does not repeat an unchanged rate for the new item. */
+    float sender_rate;
+
     /* used in digest authentication */
     char *nonce;
     char *random_pw;
@@ -700,6 +706,7 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->hls_support = false;
     raop->fast_connect = false;
     raop->media_trace_level = LOGGER_DEBUG;
+    raop->sender_rate = 1.0f;
 
     raop->nonce = NULL;
 
