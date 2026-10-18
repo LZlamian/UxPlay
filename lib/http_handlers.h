@@ -1922,6 +1922,15 @@ static void
 http_handler_hls(raop_conn_t *conn,  http_request_t *request, http_response_t *response,
                  char **response_data, int *response_datalen) {
     raop_t *raop = conn->raop;
+    /* the playlist proxy serves the host's own media player only */
+    static const unsigned char loopback6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    const bool loopback_peer = (conn->remotelen == 4 && conn->remote[0] == 127) ||
+        (conn->remotelen == 16 && !memcmp(conn->remote, loopback6, 16));
+    if (!loopback_peer) {
+        logger_log(raop->logger, LOGGER_WARNING, "HLS playlist request from a non-local peer refused");
+        http_response_init(response, "HTTP/1.1", 403, "Forbidden");
+        return;
+    }
     if (raop->current_video == -1) {
         logger_log(raop->logger, LOGGER_ERR,"airplay_video playlist  not found");
         http_response_init(response, "HTTP/1.1", 404, "Not Found");
