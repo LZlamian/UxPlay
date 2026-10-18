@@ -31,7 +31,8 @@ struct http_request_s {
     bool is_reverse;  // if true, this is a reverse-response from client
     const char *method;
     char *url;
-    char protocol[9];
+    char protocol[9];       /* "HTTP/1.1", "RTSP/1.0" once the headers are in */
+    char protocol_name[5];  /* as llhttp reports it, possibly in pieces */
 
     char **headers;
     int headers_size;
@@ -65,8 +66,22 @@ on_url(llhttp_t *parser, const char *at, size_t length)
     request->url[urllen] = '\0';
     strncat(request->url, at, length);
 
-    strncpy(request->protocol, at + length + 1, 8);
+    /* The protocol is not read from the bytes after the URL: they may not
+       have arrived yet, or lie past the end of this read. */
+    return 0;
+}
 
+static int
+on_protocol(llhttp_t *parser, const char *at, size_t length)
+{
+    http_request_t *request = parser->data;
+    size_t used = strlen(request->protocol_name);
+    size_t room = sizeof(request->protocol_name) - 1 - used;
+    if (length > room) {
+        length = room;
+    }
+    memcpy(request->protocol_name + used, at, length);
+    request->protocol_name[used + length] = '\0';
     return 0;
 }
 
@@ -136,6 +151,9 @@ on_headers_complete(llhttp_t *parser)
     http_request_t *request = parser->data;
 
     request->method = llhttp_method_name(request->parser.method);
+    snprintf(request->protocol, sizeof(request->protocol), "%s/%u.%u",
+             request->protocol_name[0] ? request->protocol_name : "HTTP",
+             (unsigned) (parser->http_major % 10), (unsigned) (parser->http_minor % 10));
     if (request->body_limit_cb) {
         size_t limit = request->body_limit_cb(request->body_limit_opaque, request);
         if (limit) {
@@ -215,6 +233,7 @@ http_request_init(void)
 
     llhttp_settings_init(&request->parser_settings);
     request->parser_settings.on_url = &on_url;
+    request->parser_settings.on_protocol = &on_protocol;
     request->parser_settings.on_header_field = &on_header_field;
     request->parser_settings.on_header_value = &on_header_value;
     request->parser_settings.on_headers_complete = &on_headers_complete;
