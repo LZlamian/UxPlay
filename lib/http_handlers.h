@@ -32,6 +32,8 @@
 #define MAX_FCUP_MEDIA_BYTES (128U * 1024U * 1024U)
 #define MAX_FCUP_ACTION_BYTES (MAX_FCUP_MEDIA_BYTES + 1024U * 1024U)
 #define MAX_SPOOL_DIRECTORY_BYTES 768U
+/* all spooled items together, on disk */
+#define MAX_SPOOL_TOTAL_BYTES (512ULL * 1024ULL * 1024ULL)
 #define SPOOL_PATH_BYTES 1024U
 #define SPOOL_WRITE_CHUNK_BYTES (1024U * 1024U)
 
@@ -183,6 +185,23 @@ static char *
 spool_reverse_media(raop_t *raop, const char *data, size_t size) {
     if (!data || !size || size > MAX_FCUP_MEDIA_BYTES) {
         log_spool_failure(raop, "validate", EINVAL);
+        return NULL;
+    }
+    unsigned long long spooled = 0;
+    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
+        const char *existing = raop->airplay_video[i]
+            ? get_spooled_media_path(raop->airplay_video[i]) : NULL;
+        struct stat existing_info;
+        if (existing && stat(existing, &existing_info) == 0 && S_ISREG(existing_info.st_mode)) {
+            spooled += (unsigned long long) existing_info.st_size;
+        }
+    }
+    if (spooled + size > MAX_SPOOL_TOTAL_BYTES) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] spooling %zu more bytes would exceed the %llu MiB spool budget "
+                   "(%llu MiB in use)", size, MAX_SPOOL_TOTAL_BYTES / (1024ULL * 1024ULL),
+                   spooled / (1024ULL * 1024ULL));
+        log_spool_failure(raop, "budget", ENOSPC);
         return NULL;
     }
 

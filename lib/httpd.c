@@ -36,6 +36,8 @@
 /* accepted sockets are only read after select(); this bounds any recv()
    that would otherwise block the single httpd thread */
 #define HTTPD_RECV_TIMEOUT_SECONDS 5
+#define HTTPD_RECV_BUFFER_BYTES (64 * 1024)
+#define HTTPD_DEFAULT_BODY_BUDGET_BYTES (256U * 1024U * 1024U)
 
 static const char *typename[] = {
     [CONNECTION_TYPE_UNKNOWN] = "Unknown",
@@ -76,6 +78,9 @@ struct httpd_s {
     /* Server fds for accepting connections */
     int server_fd4;
     int server_fd6;
+
+    /* request bodies buffered across all connections (httpd thread only) */
+    http_body_budget_t body_budget;
 };
 
 const char *
@@ -187,6 +192,7 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
 
     /* Use the logger provided */
     httpd->logger = logger;
+    httpd->body_budget.limit = HTTPD_DEFAULT_BODY_BUDGET_BYTES;
 
     /* Save callback pointers */
     memcpy(&httpd->callbacks, callbacks, sizeof(httpd_callbacks_t));
@@ -346,6 +352,11 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
     return 1;
 }
 
+void
+httpd_set_body_budget(httpd_t *httpd, size_t bytes) {
+    httpd->body_budget.limit = bytes;
+}
+
 bool
 httpd_nohold(httpd_t *httpd) {
     return (httpd->nohold ? true: false);
@@ -379,7 +390,14 @@ httpd_thread(void *arg)
     httpd_t *httpd = arg;
     char http[] = "HTTP/1.1";
     char event[] = "EVENT/1.0";
-    char buffer[1024];
+    char *buffer = malloc(HTTPD_RECV_BUFFER_BYTES);
+    if (!buffer) {
+        logger_log(httpd->logger, LOGGER_ERR, "httpd: could not allocate receive buffer");
+        MUTEX_LOCK(httpd->run_mutex);
+        httpd->running = 0;
+        MUTEX_UNLOCK(httpd->run_mutex);
+        return 0;
+    }
     int i;
 
     bool logger_debug = (logger_get_level(httpd->logger) >= LOGGER_DEBUG);
@@ -501,6 +519,9 @@ httpd_thread(void *arg)
             if (!connection->request) {
                 connection->request = http_request_init();
                 assert(connection->request);
+                http_request_set_body_policy(connection->request, &httpd->body_budget,
+                                             httpd->callbacks.conn_body_limit,
+                                             connection->user_data);
                 if (connection->type == CONNECTION_TYPE_PTTH) {
                     http_request_is_reverse(connection->request);
                 }
@@ -536,7 +557,7 @@ httpd_thread(void *arg)
                    and completed on a later select() */
                 int staged = connection->staging_len;
                 memcpy(buffer, connection->staging, staged);
-                ret = recv(connection->socket_fd, buffer + staged, sizeof(buffer) - 1 - staged, 0);
+                ret = recv(connection->socket_fd, buffer + staged, HTTPD_RECV_BUFFER_BYTES - 1 - staged, 0);
                 if (ret == 0) {
                     logger_log(httpd->logger, LOGGER_DEBUG, "client closed connection on socket %d",
                                connection->socket_fd);
@@ -565,7 +586,7 @@ httpd_thread(void *arg)
                     http_request_set_reverse(connection->request);  
                 }
             } else {
-                ret = recv(connection->socket_fd, buffer, sizeof(buffer) - 1, 0);
+                ret = recv(connection->socket_fd, buffer, HTTPD_RECV_BUFFER_BYTES - 1, 0);
                 if (ret == 0) {
                     httpd_remove_connection(httpd, connection);
                     continue;
@@ -609,12 +630,28 @@ httpd_thread(void *arg)
             /* Parse HTTP request from data read from connection */
             http_request_add_data(connection->request, buffer, ret);
             if (http_request_has_error(connection->request)) {
-                char *data = utils_data_to_text((const char *) buffer, ret);
-                logger_log(httpd->logger, LOGGER_ERR, "httpd error in parsing: %s\n%s\n%s",
-                           http_request_get_error_name(connection->request),
-                           http_request_get_error_description(connection->request),
-                           data);
-                free (data);
+                if (http_request_get_refusal(connection->request) == 413) {
+                    const char *protocol = http_request_get_protocol(connection->request);
+                    char refusal[128];
+                    int refusal_len = snprintf(refusal, sizeof(refusal),
+                                               "%s 413 Payload Too Large\r\nContent-Length: 0\r\n"
+                                               "Connection: close\r\n\r\n",
+                                               protocol && !strncmp(protocol, "RTSP", 4) ? "RTSP/1.0" : "HTTP/1.1");
+                    logger_log(httpd->logger, LOGGER_WARNING,
+                               "httpd: request body on socket %d exceeds its limit or the shared "
+                               "budget (%zu of %zu bytes buffered); answering 413",
+                               connection->socket_fd, httpd->body_budget.used, httpd->body_budget.limit);
+                    if (refusal_len > 0) {
+                        send(connection->socket_fd, refusal, (size_t) refusal_len, 0);
+                    }
+                } else {
+                    char *data = utils_data_to_text((const char *) buffer, ret > 256 ? 256 : ret);
+                    logger_log(httpd->logger, LOGGER_ERR, "httpd error in parsing: %s\n%s\n%s",
+                               http_request_get_error_name(connection->request),
+                               http_request_get_error_description(connection->request),
+                               data);
+                    free (data);
+                }
                 httpd_remove_connection(httpd, connection);
                 continue;
             }
@@ -705,6 +742,7 @@ httpd_thread(void *arg)
     httpd->running = 0;
     MUTEX_UNLOCK(httpd->run_mutex);
 
+    free(buffer);
     logger_log(httpd->logger, LOGGER_DEBUG, "Exiting httpd thread");
 
     return 0;
