@@ -1340,4 +1340,7 @@ raop_handler_teardown(raop_conn_t *conn,
             raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_HLS_SHUTDOWN);
         }
     }
+    if (raop->callbacks.conn_teardown) {
+        raop->callbacks.conn_teardown(raop->callbacks.cls, &teardown_96, &teardown_110);
+    }
 }

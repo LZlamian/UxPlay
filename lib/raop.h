@@ -88,7 +88,9 @@ struct raop_callbacks_s {
     void  (*conn_destroy)(void *cls);
     void  (*conn_request_timing)(void *cls, const char *method, const char *url, bool started);
     void  (*mirror_connection_timing)(void *cls, bool first_data);
-  //void  (*conn_teardown)(void *cls, bool *teardown_96, bool *teardown_110 ); /*not used */
+    /* after every TEARDOWN (obs-airplay: a TEARDOWN naming no stream ends the
+       device's whole session) */
+    void  (*conn_teardown)(void *cls, bool *teardown_96, bool *teardown_110 );
     void  (*audio_flush)(void *cls);
     void  (*video_flush)(void *cls);
     double (*audio_set_client_volume)(void *cls);
