@@ -135,8 +135,10 @@ raop_handler_info(raop_conn_t *conn,
     plist_dict_set_item(res_node, "pk", pk_node);
     free(pk);
 
+    /* With fast_connect the DNS-SD context carries the AirServer profile
+       (dnssd_set_airserver_profile), including any bits the host masked. */
     uint64_t features = dnssd_get_airplay_features(raop->dnssd);
-    if (raop->fast_connect) {
+    if (raop->fast_connect && !raop->dnssd) {
         features = UINT64_C(0x0000000E427FFFF7);
     }
     plist_t features_node = plist_new_uint(features);
@@ -486,7 +488,15 @@ raop_handler_pairverify(raop_conn_t *conn,
         } else if (raop->fast_connect) {
             /* The sender already has our long-term public key from /info.
              * Accept its first pair-verify directly instead of forcing a
-             * redundant pair-setup followed by another pair-verify. */
+             * redundant pair-setup followed by another pair-verify.
+             *
+             * This loses no security.  Without a PIN, pair-setup
+             * authenticates neither side: it only hands the sender the same
+             * Ed25519 public key /info already published.  pair-verify is
+             * the key agreement (X25519 plus a signature by that key) and
+             * still runs in full, so the session keys are the same as after
+             * pair-setup.  With a PIN (use_pin, above) pair-setup is the
+             * authentication step and is still required. */
             pairing_session_set_setup_status(conn->session);
         } else {
             return;
