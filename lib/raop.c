@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #include "raop.h"
 #include "raop_rtp.h"
@@ -103,6 +104,11 @@ struct raop_s {
      * (media_url_policy.h). */
     unsigned short media_ports[RAOP_MAX_MEDIA_PORTS];
     int media_port_count;
+
+    /* raop_set_media_policy: refuse every POST /play, or allow only URLs
+     * on the sender's own address.  Set from the host's thread. */
+    atomic_bool media_video_refused;
+    atomic_bool media_sender_only;
 
     /* The playback rate the sender's player last asked for (POST /rate, or
      * the rate in a POST /play body).  The rate belongs to the sender's
@@ -811,6 +817,8 @@ raop_init(raop_callbacks_t *callbacks) {
         raop_set_media_ports(raop, default_media_ports,
                              (int) (sizeof(default_media_ports) / sizeof(default_media_ports[0])));
     }
+    atomic_init(&raop->media_video_refused, false);
+    atomic_init(&raop->media_sender_only, false);
     raop->sender_rate = 1.0f;
 
     raop->nonce = NULL;
@@ -924,6 +932,13 @@ raop_set_media_ports(raop_t *raop, const unsigned short *ports, int count) {
     for (int i = 0; ports && i < count && raop->media_port_count < RAOP_MAX_MEDIA_PORTS; ++i) {
         if (ports[i]) raop->media_ports[raop->media_port_count++] = ports[i];
     }
+}
+
+void
+raop_set_media_policy(raop_t *raop, bool accept_video, bool sender_only) {
+    assert(raop);
+    atomic_store(&raop->media_video_refused, !accept_video);
+    atomic_store(&raop->media_sender_only, sender_only);
 }
 
 int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {

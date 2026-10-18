@@ -5,7 +5,8 @@
  * become a proxy into the host itself or onto unusual services: loopback,
  * unspecified, multicast and reserved targets are refused, link-local ones
  * are allowed only when they are the sender's own address, and hosts other
- * than the sender may only be reached on the configured web ports.
+ * than the sender may only be reached on the configured web ports (or not at
+ * all with raop_set_media_policy's sender_only).
  *
  * This is a textual check of the URL.  Hostnames are resolved, redirects
  * followed and nested HLS resources fetched by the host application, which
@@ -200,6 +201,9 @@ media_url_policy_check(raop_conn_t *conn, const char *url) {
         case MEDIA_ADDRESS_ROUTABLE:
             break;
         }
+    }
+    if (!is_peer && atomic_load(&raop->media_sender_only)) {
+        return "host is not the sending device (only the sending device is allowed)";
     }
     if (!is_peer && !media_port_allowed(raop, port)) {
         return "port not allowed for a host other than the sender";

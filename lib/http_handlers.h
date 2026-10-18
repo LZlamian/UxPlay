@@ -1218,6 +1218,17 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
    "start position in seconds".   Once this request is received by the Sever, the Server sends a POST /event
    "FCUP Request" request to the Client on the reverse http channel, to request the HLS Master Playlist */
 
+#define MEDIA_VIDEO_OFF_REASON "AirPlay video is turned off on this receiver"
+
+/* Logs a refused AirPlay video request and tells the host why. */
+static void
+media_play_refused(raop_t *raop, const char *what, const char *reason) {
+    logger_log(raop->logger, LOGGER_ERR, "[MEDIA] %s refused: %s", what, reason);
+    if (raop->callbacks.on_video_refused) {
+        raop->callbacks.on_video_refused(raop->callbacks.cls, reason);
+    }
+}
+
 static bool
 media_location_is_http(const char *location) {
     return location && (!strncasecmp(location, "http://", 7) ||
@@ -1406,6 +1417,10 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
     bool playback_stopped = false;
     bool sender_hosted = false;
 
+    if (atomic_load(&raop->media_video_refused)) {
+        media_play_refused(raop, "AirPlay video item", MEDIA_VIDEO_OFF_REASON);
+        goto play_error;
+    }
 
     if (!plist_dict_get_item(req_root_node, "Content-Location")) {
         char *hosted = play_sender_hosted_location(conn, req_root_node);
@@ -1434,8 +1449,7 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         const char *refused = media_location_is_http(policy_location)
             ? media_url_policy_check(conn, policy_location) : NULL;
         if (refused) {
-            logger_log(raop->logger, LOGGER_ERR,
-                       "[MEDIA] POST /play Content-Location refused: %s", refused);
+            media_play_refused(raop, "POST /play Content-Location", refused);
             goto play_error;
         }
     }
@@ -1810,6 +1824,10 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
                apple_session_id ? apple_session_id : "(missing)", request_datalen);
 
     if (data_is_text_parameters) {
+        if (atomic_load(&raop->media_video_refused)) {
+            media_play_refused(raop, "classic POST /play", MEDIA_VIDEO_OFF_REASON);
+            goto play_error;
+        }
         playback_location = play_text_parameter(request_data, request_datalen,
                                                 "Content-Location");
         if (!playback_location) {
@@ -1843,8 +1861,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
         }
         const char *refused = media_url_policy_check(conn, playback_location);
         if (refused) {
-            logger_log(raop->logger, LOGGER_ERR,
-                       "[MEDIA] classic POST /play Content-Location refused: %s", refused);
+            media_play_refused(raop, "classic POST /play Content-Location", refused);
             goto play_error;
         }
         logger_log(raop->logger, LOGGER_INFO,

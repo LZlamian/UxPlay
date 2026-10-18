@@ -117,6 +117,9 @@ struct raop_callbacks_s {
     void  (*on_video_stop) (void *cls);
     void  (*on_video_acquire_playback_info) (void *cls, playback_info_t *playback_video);
     float  (*on_video_playlist_remove) (void *cls);
+    /* optional: a POST /play (or playlistInsert) was refused; `reason` is
+       the text logged for it */
+    void  (*on_video_refused) (void *cls, const char *reason);
 };
 
 typedef struct raop_callbacks_s raop_callbacks_t;
@@ -139,6 +142,10 @@ RAOP_API int raop_set_plist(raop_t *raop, const char *plist_item, const int valu
  * 80, 443, 8080, 8443; at most RAOP_MAX_MEDIA_PORTS). */
 #define RAOP_MAX_MEDIA_PORTS 16
 RAOP_API void raop_set_media_ports(raop_t *raop, const unsigned short *ports, int count);
+/* accept_video false: every POST /play is answered 400 (screen mirroring is
+ * unaffected).  sender_only: a POST /play URL must be the sender's own
+ * address.  Both apply to the next request. */
+RAOP_API void raop_set_media_policy(raop_t *raop, bool accept_video, bool sender_only);
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
 RAOP_API void raop_set_lang(raop_t *raop, const char *lang);
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);
