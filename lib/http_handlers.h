@@ -572,6 +572,11 @@ http_handler_fpsetup2(raop_conn_t *conn, http_request_t *request, http_response_
     http_response_add_header(response, "Content-Type", "application/x-apple-binary-plist");
     int req_datalen = 0;
     const unsigned char *req_data = (unsigned char *) http_request_get_data(request, &req_datalen);
+    if (!req_data || req_datalen < 5) {
+        logger_log(raop->logger, LOGGER_ERR, "fp-setup2 request body too short (%d bytes)", req_datalen);
+        http_response_init(response, "HTTP/1.1", 400, "Bad Request");
+        return;
+    }
     logger_log(raop->logger, LOGGER_ERR, "only FairPlay version 0x03 is implemented, version is 0x%2.2x",
                req_data[4]);
     http_response_init(response, "HTTP/1.1", 421, "Misdirected Request");
