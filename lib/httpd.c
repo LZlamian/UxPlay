@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <time.h>
 
 #include "httpd.h"
 #include "netutils.h"
@@ -28,6 +29,13 @@
 #include "compat.h"
 #include "logger.h"
 #include "utils.h"
+
+/* drop a connection that stalls mid-request (or never identifies itself)
+   for this long; idle keep-alive connections between requests are kept */
+#define HTTPD_DEAD_CONNECTION_TIMEOUT 60
+/* accepted sockets are only read after select(); this bounds any recv()
+   that would otherwise block the single httpd thread */
+#define HTTPD_RECV_TIMEOUT_SECONDS 5
 
 static const char *typename[] = {
     [CONNECTION_TYPE_UNKNOWN] = "Unknown",
@@ -44,6 +52,9 @@ struct http_connection_s {
     void *user_data;
     connection_type_t type;
     http_request_t *request;
+    char staging[8];
+    int staging_len;
+    time_t last_active;
 };
 typedef struct http_connection_s http_connection_t;
 
@@ -227,6 +238,7 @@ httpd_remove_connection(httpd_t *httpd, http_connection_t *connection)
         httpd->open_connections--;
     }
     connection->type = CONNECTION_TYPE_UNKNOWN;
+    connection->staging_len = 0;
 }
 
 static int
@@ -257,6 +269,8 @@ httpd_add_connection(httpd_t *httpd, int fd, unsigned char *local, int local_len
     httpd->connections[i].connected = 1;
     httpd->connections[i].user_data = user_data;
     httpd->connections[i].type = CONNECTION_TYPE_UNKNOWN;   //should not be necessary ...
+    httpd->connections[i].staging_len = 0;
+    httpd->connections[i].last_active = time(NULL);
     return 0;
 }
 
@@ -288,6 +302,18 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
                    (const char *) &tcp_nodelay, sizeof(tcp_nodelay)) == -1) {
         logger_log(httpd->logger, LOGGER_WARNING,
                    "Could not set TCP_NODELAY on accepted socket %d: %d",
+                   fd, SOCKET_GET_ERROR());
+    }
+
+#ifdef WIN32
+    DWORD recv_timeout = HTTPD_RECV_TIMEOUT_SECONDS * 1000;
+#else
+    struct timeval recv_timeout = { HTTPD_RECV_TIMEOUT_SECONDS, 0 };
+#endif
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                   (const char *) &recv_timeout, sizeof(recv_timeout)) == -1) {
+        logger_log(httpd->logger, LOGGER_WARNING,
+                   "Could not set SO_RCVTIMEO on accepted socket %d: %d",
                    fd, SOCKET_GET_ERROR());
     }
 
@@ -364,7 +390,6 @@ httpd_thread(void *arg)
         struct timeval tv;
         int nfds=0;
         int ret;
-        int new_request;
 
         MUTEX_LOCK(httpd->run_mutex);
         if (!httpd->running) {
@@ -406,14 +431,36 @@ httpd_thread(void *arg)
         }
 
         ret = select(nfds, &rfds, NULL, NULL, &tv);
-        if (ret == 0) {
-            /* Timeout happened */
-            continue;
-        } else if (ret == -1) {
+        if (ret == -1) {
             int sock_err = SOCKET_GET_ERROR();
             logger_log(httpd->logger, LOGGER_ERR,
 		       "httpd error in select: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
             break;
+        }
+
+        /* remove dead connections: never identified, or stalled part-way
+           through a request (ported from upstream e60d981, applied to every
+           connection rather than only readable ones) */
+        time_t now = time(NULL);
+        for (i = 0; i < httpd->max_connections; i++) {
+            http_connection_t *connection = &httpd->connections[i];
+            if (!connection->connected) {
+                continue;
+            }
+            bool stalled = connection->type == CONNECTION_TYPE_UNKNOWN ||
+                (connection->staging_len > 0 && connection->request &&
+                 !http_request_is_reverse(connection->request));
+            if (stalled && now - connection->last_active > HTTPD_DEAD_CONNECTION_TIMEOUT) {
+                logger_log(httpd->logger, LOGGER_WARNING,
+                           "httpd closing dead connection on socket %d after %d seconds of inactivity",
+                           connection->socket_fd, HTTPD_DEAD_CONNECTION_TIMEOUT);
+                httpd_remove_connection(httpd, connection);
+            }
+        }
+
+        if (ret == 0) {
+            /* Timeout happened */
+            continue;
         }
 
         if (httpd->open_connections < httpd->max_connections &&
@@ -454,14 +501,11 @@ httpd_thread(void *arg)
             if (!connection->request) {
                 connection->request = http_request_init();
                 assert(connection->request);
-                new_request = 1;
                 if (connection->type == CONNECTION_TYPE_PTTH) {
                     http_request_is_reverse(connection->request);
                 }
                 logger_log(httpd->logger, LOGGER_DEBUG, "new request, connection %d, socket %d type %s",
                            i, connection->socket_fd, typename [connection->type]);
-            } else {
-                new_request = 0;
             }
 
             logger_log(httpd->logger, LOGGER_DEBUG, "httpd receiving on socket %d, connection %d",
@@ -486,50 +530,57 @@ httpd_thread(void *arg)
             }
             /* reverse-http responses from the client must not be sent to the llhttp parser:
              * such messages start with "HTTP/1.1" (or sometimes with "EVENT/1.0")  */
-            if (new_request) {
-                int readstart = 0;
-                new_request = 0;
-                while (readstart < 8) {
-                    if (!connection->socket_fd) {
-                        break;
+            if (connection->staging_len < 8) {
+                /* never block waiting for the first 8 bytes of a request
+                   (ported from upstream d7a088d): a short read is staged
+                   and completed on a later select() */
+                int staged = connection->staging_len;
+                memcpy(buffer, connection->staging, staged);
+                ret = recv(connection->socket_fd, buffer + staged, sizeof(buffer) - 1 - staged, 0);
+                if (ret == 0) {
+                    logger_log(httpd->logger, LOGGER_DEBUG, "client closed connection on socket %d",
+                               connection->socket_fd);
+                    httpd_remove_connection(httpd, connection);
+                    continue;
+                } else if (ret == -1) {
+                    int sock_err = SOCKET_GET_ERROR();
+                    if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK) ||
+                        sock_err == SOCKET_ERRORNAME(EINTR)) {
+                        continue;
                     }
-                    ret = recv(connection->socket_fd, buffer + readstart, sizeof(buffer) - 1 - readstart, 0);
-                    if (ret == 0) {
-                        logger_log(httpd->logger, LOGGER_DEBUG, "client closed connection on socket %d",
-                                   connection->socket_fd);
-                        break;
-                    } else if (ret == -1) {
-                        if (errno == EAGAIN) {
-                            continue;
-                        } else {
-                            int sock_err = SOCKET_GET_ERROR();
-                            logger_log(httpd->logger, LOGGER_ERR, "httpd: recv error %d on socket %d: %s",
-                                       sock_err, connection->socket_fd, SOCKET_ERROR_STRING(sock_err));
-                            break;
-                        }
-                    } else {
-                        readstart += ret;
-                        ret = readstart;
-                    }
-                }
-                if (!connection->socket_fd) {
-                    /* connection was recently removed */
+                    logger_log(httpd->logger, LOGGER_ERR, "httpd: recv error %d on socket %d: %s",
+                               sock_err, connection->socket_fd, SOCKET_ERROR_STRING(sock_err));
+                    httpd_remove_connection(httpd, connection);
                     continue;
                 }
+                connection->last_active = time(NULL);
+                ret += staged;
+                if (ret < 8) {
+                    memcpy(connection->staging, buffer, ret);
+                    connection->staging_len = ret;
+                    continue;
+                }
+                connection->staging_len = 8;
                 if (!memcmp(buffer, http, 8) || !memcmp(buffer, event, 8)) {
                     http_request_set_reverse(connection->request);  
                 }
             } else {
-                if (connection->socket_fd) {
-                    ret = recv(connection->socket_fd, buffer, sizeof(buffer) - 1, 0);
-                    if (ret == 0) {
-                        httpd_remove_connection(httpd, connection);
+                ret = recv(connection->socket_fd, buffer, sizeof(buffer) - 1, 0);
+                if (ret == 0) {
+                    httpd_remove_connection(httpd, connection);
+                    continue;
+                } else if (ret == -1) {
+                    int sock_err = SOCKET_GET_ERROR();
+                    if (sock_err == SOCKET_ERRORNAME(EAGAIN) || sock_err == SOCKET_ERRORNAME(EWOULDBLOCK) ||
+                        sock_err == SOCKET_ERRORNAME(EINTR)) {
                         continue;
                     }
-                } else {
-                    /* connection was recently removed */
+                    logger_log(httpd->logger, LOGGER_ERR, "httpd: recv error %d on socket %d: %s",
+                               sock_err, connection->socket_fd, SOCKET_ERROR_STRING(sock_err));
+                    httpd_remove_connection(httpd, connection);
                     continue;
                 }
+                connection->last_active = time(NULL);
             }
             if (http_request_is_reverse(connection->request)) {
                 /* this is a response from the client to a
@@ -583,6 +634,7 @@ httpd_thread(void *arg)
                 httpd->callbacks.conn_request(connection->user_data, connection->request, &response);
                 http_request_destroy(connection->request);
                 connection->request = NULL;
+                connection->staging_len = 0;
 
                 if (response) {
                     const char *data;
