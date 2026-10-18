@@ -817,8 +817,8 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
                     char **response_data, int *response_datalen) {
 
     raop_t *raop = conn->raop;
+    /* NULL before a POST /play: the handlers below check */
     airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
-    assert(airplay_video);
     bool data_is_plist = false;
     plist_t req_root_node = NULL;
     uint64_t uint_val = 0;
@@ -1504,8 +1504,7 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         }
     }
 
-    assert (count < MAX_AIRPLAY_VIDEO);
-    assert(id == -1);
+    id = -1;
     /* initialize new airplay_video structure to hold playlist */
     for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
         if (raop->airplay_video[i]) {
@@ -1514,12 +1513,21 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         id = i;
         break;
     }
-    assert(id >= 0);
+    if (id < 0) {
+        logger_log(raop->logger, LOGGER_ERR, "[MEDIA] no free playlist slot for POST /play");
+        plist_mem_free(playback_uuid);
+        goto play_error;
+    }
 
-    raop->current_video = id;
     raop->airplay_video[id] = airplay_video_init(raop, raop->port, raop->lang);
+    if (!raop->airplay_video[id]) {
+        logger_log(raop->logger, LOGGER_ERR, "[MEDIA] could not allocate playlist for POST /play");
+        plist_mem_free(playback_uuid);
+        id = -1;
+        goto play_error;
+    }
+    raop->current_video = id;
     airplay_video = hls_get_current_video(raop);
-    assert(airplay_video);
     created_airplay_video = true;
     set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
     set_playback_uuid(airplay_video, playback_uuid, strlen(playback_uuid));
@@ -1891,8 +1899,11 @@ http_handler_hls(raop_conn_t *conn,  http_request_t *request, http_response_t *r
         free (header_str);
         return;
     }
-    airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
-    assert(airplay_video);
+    airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);    
+    if (!airplay_video) {
+        http_response_init(response, "HTTP/1.1", 404, "Not Found");
+        return;
+    }
     if (!strcmp(url, "/master.m3u8")){
         char * master_playlist  = get_master_playlist(airplay_video);
         if (master_playlist) {
