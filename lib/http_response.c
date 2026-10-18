@@ -90,6 +90,15 @@ http_response_init(http_response_t *response, const char *protocol, int code, co
     http_response_add_data(response, "\r\n", 2);
 }
 
+bool
+http_response_is_ok(http_response_t *response)
+{
+    assert(response);
+    const char *space = memchr(response->data, ' ', response->data_length);
+    return space && (size_t) (space - response->data) + 4 <= (size_t) response->data_length &&
+        !memcmp(space + 1, "200", 3);
+}
+
 void
 http_response_reverse_request_init(http_response_t *request, const char *method, const char *url, const char *protocol)
 {
