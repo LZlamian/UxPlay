@@ -18,6 +18,7 @@
 
 #include "airplay_video.h"
 #include "fcup_request.h"
+#include "media_url_policy.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -1405,6 +1406,21 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         }
     }
 
+    if (!sender_hosted) {
+        /* A sender-hosted URL is built from this connection's own address;
+           any other URL the receiver would fetch must pass the policy. */
+        plist_t policy_node = plist_dict_get_item(req_root_node, "Content-Location");
+        const char *policy_location = policy_node && PLIST_IS_STRING(policy_node)
+            ? plist_get_string_ptr(policy_node, NULL) : NULL;
+        const char *refused = media_location_is_http(policy_location)
+            ? media_url_policy_check(conn, policy_location) : NULL;
+        if (refused) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "[MEDIA] POST /play Content-Location refused: %s", refused);
+            goto play_error;
+        }
+    }
+
     plist_t req_uuid_node = plist_dict_get_item(req_root_node, "uuid");
     if (!req_uuid_node) {
         plist_t location_node = plist_dict_get_item(req_root_node, "Content-Location");
@@ -1804,6 +1820,12 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
                        "[MEDIA] classic POST /play rejected Content-Location "
                        "scheme=%s length=%zu (only HTTP(S) is supported)",
                        scheme, playback_location ? strlen(playback_location) : 0);
+            goto play_error;
+        }
+        const char *refused = media_url_policy_check(conn, playback_location);
+        if (refused) {
+            logger_log(raop->logger, LOGGER_ERR,
+                       "[MEDIA] classic POST /play Content-Location refused: %s", refused);
             goto play_error;
         }
         logger_log(raop->logger, LOGGER_INFO,
