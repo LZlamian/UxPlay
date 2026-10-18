@@ -132,6 +132,10 @@ RAOP_API void raop_set_log_level(raop_t *raop, int level);
 RAOP_API void raop_set_media_trace_level(raop_t *raop, int level);
 RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls);
 RAOP_API int raop_set_plist(raop_t *raop, const char *plist_item, const int value);
+/* Ports a POST /play URL may use on a host other than the sender (default
+ * 80, 443, 8080, 8443; at most RAOP_MAX_MEDIA_PORTS). */
+#define RAOP_MAX_MEDIA_PORTS 16
+RAOP_API void raop_set_media_ports(raop_t *raop, const unsigned short *ports, int count);
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
 RAOP_API void raop_set_lang(raop_t *raop, const char *lang);
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);

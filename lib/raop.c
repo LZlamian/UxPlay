@@ -97,6 +97,11 @@ struct raop_s {
      * complete /play, /reverse, FCUP and playback-control flow visible. */
     int media_trace_level;
 
+    /* Ports a POST /play URL may use on a host other than the sender
+     * (media_url_policy.h). */
+    unsigned short media_ports[RAOP_MAX_MEDIA_PORTS];
+    int media_port_count;
+
     /* The playback rate the sender's player last asked for (POST /rate, or
      * the rate in a POST /play body).  The rate belongs to the sender's
      * player, not to an item: an item swapped in with playlistInsert keeps
@@ -710,6 +715,11 @@ raop_init(raop_callbacks_t *callbacks) {
     raop->hls_support = false;
     raop->fast_connect = false;
     raop->media_trace_level = LOGGER_DEBUG;
+    {
+        static const unsigned short default_media_ports[] = {80, 443, 8080, 8443};
+        raop_set_media_ports(raop, default_media_ports,
+                             (int) (sizeof(default_media_ports) / sizeof(default_media_ports[0])));
+    }
     raop->sender_rate = 1.0f;
 
     raop->nonce = NULL;
@@ -813,6 +823,15 @@ void
 raop_set_media_trace_level(raop_t *raop, int level) {
     assert(raop);
     raop->media_trace_level = level;
+}
+
+void
+raop_set_media_ports(raop_t *raop, const unsigned short *ports, int count) {
+    assert(raop);
+    raop->media_port_count = 0;
+    for (int i = 0; ports && i < count && raop->media_port_count < RAOP_MAX_MEDIA_PORTS; ++i) {
+        if (ports[i]) raop->media_ports[raop->media_port_count++] = ports[i];
+    }
 }
 
 int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
