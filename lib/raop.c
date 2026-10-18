@@ -423,8 +423,12 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         free(header_str);
     }
     
-    if (client_session_id) {
-        assert(!strcmp(client_session_id, conn->client_session_id));
+    if (client_session_id &&
+        (!conn->client_session_id || strcmp(client_session_id, conn->client_session_id))) {
+        logger_log(raop->logger, LOGGER_WARNING,
+                   "rejecting %s %s: X-Apple-Session-ID does not match this connection", method, url);
+        http_response_init(*response, protocol, 400, "Bad Request");
+        goto finish;
     }
 
     media_traced = !hls_request && !strcmp(protocol, "HTTP/1.1");
