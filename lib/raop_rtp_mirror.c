@@ -337,13 +337,13 @@ raop_rtp_mirror_thread(void *arg)
 
             /*packet[0:3] contains the payload size */
             int payload_size = byteutils_get_int(packet, 0);
+            /* "xx xx xx xx " for log lines, without four snprintf calls per packet */
             char packet_description[13] = {0};
-            char *p = packet_description;
-            int n = sizeof(packet_description);
-            for (int i = 4; i < 8; i++) {
-                snprintf(p, n, "%2.2x ", (unsigned int) packet[i]);
-                n -= 3;
-                p += 3;
+            static const char hex_digits[] = "0123456789abcdef";
+            for (int i = 0; i < 4; i++) {
+                packet_description[3 * i] = hex_digits[(packet[4 + i] >> 4) & 0x0f];
+                packet_description[3 * i + 1] = hex_digits[packet[4 + i] & 0x0f];
+                packet_description[3 * i + 2] = ' ';
             }
             ntp_timestamp_raw = byteutils_get_long(packet, 8);
             ntp_timestamp_remote = raop_ntp_timestamp_to_nano_seconds(ntp_timestamp_raw, false);
