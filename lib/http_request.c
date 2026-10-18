@@ -23,9 +23,6 @@
 #include "http_request.h"
 #include "llhttp/llhttp.h"
 
-/* FCUP can return a complete page-local media object in one binary plist.
- * Keep request accumulation bounded before plist parsing duplicates it. */
-#define MAX_HTTP_REQUEST_BODY_BYTES (129U * 1024U * 1024U)
 
 struct http_request_s {
     llhttp_t parser;
@@ -43,6 +40,15 @@ struct http_request_s {
     char *data;
     int datalen;
     size_t data_capacity;
+
+    /* FCUP can return a complete page-local media object in one binary
+       plist, but only a pending reverse fetch may send that much: the owner
+       raises body_limit for it when the headers are in. */
+    size_t body_limit;
+    http_body_budget_t *budget;
+    http_request_body_limit_cb body_limit_cb;
+    void *body_limit_opaque;
+    int refusal;
 
     int complete;
 };
@@ -125,12 +131,34 @@ on_header_value(llhttp_t *parser, const char *at, size_t length)
 }
 
 static int
+on_headers_complete(llhttp_t *parser)
+{
+    http_request_t *request = parser->data;
+
+    request->method = llhttp_method_name(request->parser.method);
+    if (request->body_limit_cb) {
+        size_t limit = request->body_limit_cb(request->body_limit_opaque, request);
+        if (limit) {
+            request->body_limit = limit < HTTP_REQUEST_MAX_BODY_BYTES
+                ? limit : HTTP_REQUEST_MAX_BODY_BYTES;
+        }
+    }
+    /* refuse a declared body that cannot fit before reading any of it */
+    if ((parser->flags & F_CONTENT_LENGTH) && parser->content_length > request->body_limit) {
+        request->refusal = 413;
+        return -1;
+    }
+    return 0;
+}
+
+static int
 on_body(llhttp_t *parser, const char *at, size_t length)
 {
     http_request_t *request = parser->data;
 
-    if (length > MAX_HTTP_REQUEST_BODY_BYTES || request->datalen < 0 ||
-        (size_t) request->datalen > MAX_HTTP_REQUEST_BODY_BYTES - length) {
+    if (length > request->body_limit || request->datalen < 0 ||
+        (size_t) request->datalen > request->body_limit - length) {
+        request->refusal = 413;
         return -1;
     }
 
@@ -143,12 +171,20 @@ on_body(llhttp_t *parser, const char *at, size_t length)
         while (capacity < needed) {
             capacity *= 2;
         }
-        if (capacity > MAX_HTTP_REQUEST_BODY_BYTES) {
-            capacity = MAX_HTTP_REQUEST_BODY_BYTES;
+        if (capacity > request->body_limit) {
+            capacity = request->body_limit;
+        }
+        http_body_budget_t *budget = request->budget;
+        if (budget && budget->used - request->data_capacity + capacity > budget->limit) {
+            request->refusal = 413;
+            return -1;
         }
         char *data = realloc(request->data, capacity);
         if (!data) {
             return -1;
+        }
+        if (budget) {
+            budget->used = budget->used - request->data_capacity + capacity;
         }
         request->data = data;
         request->data_capacity = capacity;
@@ -181,13 +217,33 @@ http_request_init(void)
     request->parser_settings.on_url = &on_url;
     request->parser_settings.on_header_field = &on_header_field;
     request->parser_settings.on_header_value = &on_header_value;
+    request->parser_settings.on_headers_complete = &on_headers_complete;
     request->parser_settings.on_body = &on_body;
     request->parser_settings.on_message_complete = &on_message_complete;
 
     llhttp_init(&request->parser, HTTP_REQUEST, &request->parser_settings);
     request->parser.data = request;
     request->is_reverse = false;
+    request->body_limit = HTTP_REQUEST_DEFAULT_BODY_BYTES;
     return request;
+}
+
+void
+http_request_set_body_policy(http_request_t *request, http_body_budget_t *budget,
+                             http_request_body_limit_cb body_limit, void *opaque)
+{
+    assert(request);
+    assert(!request->data_capacity);
+    request->budget = budget;
+    request->body_limit_cb = body_limit;
+    request->body_limit_opaque = opaque;
+}
+
+int
+http_request_get_refusal(http_request_t *request)
+{
+    assert(request);
+    return request->refusal;
 }
 
 void
@@ -199,6 +255,9 @@ http_request_destroy(http_request_t *request)
             free(request->headers[i]);
         }
         free(request->headers);
+        if (request->budget) {
+            request->budget->used -= request->data_capacity;
+        }
         free(request->data);
         free(request);
     }

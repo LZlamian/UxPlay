@@ -36,9 +36,13 @@ struct httpd_callbacks_s {
     void  (*conn_request)(void *ptr, http_request_t *request, http_response_t **response);
     void  (*conn_response_sent)(void *ptr, http_response_t *response);
     void  (*conn_destroy)(void *ptr);
+    /* optional: body limit for a request whose headers are in (0 = default) */
+    size_t (*conn_body_limit)(void *ptr, http_request_t *request);
 };
 typedef struct httpd_callbacks_s httpd_callbacks_t;
 bool httpd_nohold(httpd_t *httpd);
+/* Request bodies buffered across all connections at once (default 256 MiB). */
+void httpd_set_body_budget(httpd_t *httpd, size_t bytes);
 void httpd_remove_known_connections(httpd_t *httpd);
 void httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type);
 

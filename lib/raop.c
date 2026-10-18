@@ -606,6 +606,31 @@ conn_response_sent(void *ptr, http_response_t *response) {
     http_send_pending_reverse_media(conn);
 }
 
+/* Bodies are capped at HTTP_REQUEST_DEFAULT_BODY_BYTES, except the sender's
+   reply to a reverse fetch the current item is waiting for, which carries
+   the whole media object. */
+static size_t
+conn_body_limit(void *ptr, http_request_t *request) {
+    raop_conn_t *conn = (raop_conn_t *) ptr;
+    raop_t *raop = conn->raop;
+    const char *method = http_request_get_method(request);
+    const char *url = http_request_get_url(request);
+    if (!method || !url || strcmp(method, "POST") || strcmp(url, "/action")) {
+        return 0;
+    }
+    airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
+    if (!airplay_video || !get_reverse_media_pending(airplay_video)) {
+        return 0;
+    }
+    const char *session = http_request_get_header(request, "X-Apple-Session-ID");
+    const char *item_session = get_apple_session_id(airplay_video);
+    if (!session || !item_session || strcmp(session, item_session) ||
+        !conn->client_session_id || strcmp(session, conn->client_session_id)) {
+        return 0;
+    }
+    return MAX_FCUP_ACTION_BYTES;
+}
+
 static void
 conn_destroy(void *ptr) {
     raop_conn_t *conn = ptr;
@@ -771,6 +796,7 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
     httpd_cbs.conn_request = &conn_request;
     httpd_cbs.conn_response_sent = &conn_response_sent;
     httpd_cbs.conn_destroy = &conn_destroy;
+    httpd_cbs.conn_body_limit = &conn_body_limit;
 
     /* Initialize the http daemon, (this will take a copy of httpd_cbs) */
     httpd = httpd_init(raop->logger, &httpd_cbs, nohold);
@@ -873,6 +899,13 @@ int raop_set_plist(raop_t *raop, const char *plist_item, const int value) {
         raop->use_pin = true;
     } else if (strcmp(plist_item, "hls") == 0) {
         raop->hls_support = (value > 0 ? true : false);
+    } else if (strcmp(plist_item, "max_inflight_body_mib") == 0) {
+        /* request bodies buffered across all connections at once */
+        if (value <= 0 || value > 4096 || !raop->httpd) {
+            retval = 1;
+        } else {
+            httpd_set_body_budget(raop->httpd, (size_t) value * 1024U * 1024U);
+        }
     } else {
         retval = -1;
     }	  
