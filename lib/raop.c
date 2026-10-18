@@ -110,6 +110,12 @@ struct raop_s {
      * it, and iOS does not repeat an unchanged rate for the new item. */
     float sender_rate;
 
+    /* The address of the peer whose POST /play started the current AirPlay
+     * video session (video_owner_len 0: none).  Only it may control or end
+     * the session; another peer may only start a new one. */
+    unsigned char video_owner[16];
+    int video_owner_len;
+
     /* used in digest authentication */
     char *nonce;
     char *random_pw;
@@ -206,6 +212,47 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     }
 
     return conn;
+}
+
+static bool
+video_peer_is_owner(raop_conn_t *conn) {
+    raop_t *raop = conn->raop;
+    return raop->video_owner_len == 0 ||
+        (conn->remotelen == raop->video_owner_len &&
+         !memcmp(conn->remote, raop->video_owner, (size_t) raop->video_owner_len));
+}
+
+static void
+video_set_owner(raop_conn_t *conn) {
+    raop_t *raop = conn->raop;
+    if (conn->remotelen <= 0 || conn->remotelen > (int) sizeof(raop->video_owner)) {
+        raop->video_owner_len = 0;
+        return;
+    }
+    memcpy(raop->video_owner, conn->remote, (size_t) conn->remotelen);
+    raop->video_owner_len = conn->remotelen;
+}
+
+/* requests that act on the current AirPlay video session */
+static bool
+video_control_handler(raop_handler_t handler) {
+    return handler == &http_handler_stop || handler == &http_handler_rate ||
+        handler == &http_handler_scrub || handler == &http_handler_action;
+}
+
+/* AirPlay video connections still open from the session owner (all of them
+   when there is no owner) */
+static int
+video_owner_connection_count(raop_t *raop) {
+    int count = 0;
+    for (int instance = 1; ; ++instance) {
+        raop_conn_t *other = (raop_conn_t *) httpd_get_connection_by_type(raop->httpd,
+                                                                         CONNECTION_TYPE_AIRPLAY,
+                                                                         instance);
+        if (!other) break;
+        if (video_peer_is_owner(other)) count++;
+    }
+    return count;
 }
 
 static void
@@ -522,8 +569,17 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         handler = &http_handler_hls;
     }
 
-    if (handler != NULL) {
+    if (handler != NULL && video_control_handler(handler) && !video_peer_is_owner(conn)) {
+        logger_log(raop->logger, LOGGER_WARNING,
+                   "[MEDIA] %s %s refused: AirPlay video belongs to another sender", method, url);
+        http_response_init(*response, protocol, 403, "Forbidden");
+    } else if (handler != NULL) {
         handler(conn, request, *response, &response_data, &response_datalen);
+        if (handler == &http_handler_play && http_response_is_ok(*response)) {
+            video_set_owner(conn);
+        } else if (handler == &http_handler_stop) {
+            raop->video_owner_len = 0;
+        }
     } else {
         logger_log(raop->logger, LOGGER_INFO,
                    "Unhandled Client Request: %s %s %s", method, url, protocol);
@@ -641,9 +697,10 @@ conn_destroy(void *ptr) {
        POST /stop.  When the last AirPlay video connection goes away (it is
        still counted here), stop URL playback so the output does not keep
        showing a stale frame. */
-    if (conn->connection_type == CONNECTION_TYPE_AIRPLAY &&
-        httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_AIRPLAY) <= 1 &&
+    if (conn->connection_type == CONNECTION_TYPE_AIRPLAY && video_peer_is_owner(conn) &&
+        video_owner_connection_count(raop) <= 1 &&
         raop->callbacks.on_video_stop) {
+        raop->video_owner_len = 0;
         /* (the current item may already have been removed by playlistRemove
            while its last frame is still held) */
         logger_log(raop->logger, LOGGER_INFO,

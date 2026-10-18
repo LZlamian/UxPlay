@@ -18,10 +18,14 @@
 #ifndef HTTP_RESPONSE_H
 #define HTTP_RESPONSE_H
 
+#include <stdbool.h>
+
 typedef struct http_response_s http_response_t;
 
 http_response_t *http_response_create();
 void http_response_init(http_response_t *response, const char *protocol, int code, const char *message);
+/* true when the status line (as last initialised) is 200 */
+bool http_response_is_ok(http_response_t *response);
 void http_response_reverse_request_init(http_response_t *request, const char *method, const char *url,
                                         const char *protocol);
 
