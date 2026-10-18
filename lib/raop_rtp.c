@@ -23,6 +23,7 @@
 #include <stdbool.h>
 
 #include "raop_rtp.h"
+#include "wake_pipe.h"
 #include "raop.h"
 #include "raop_buffer.h"
 #include "netutils.h"
@@ -42,6 +43,8 @@
 
 struct raop_rtp_s {
     logger_t *logger;
+    /* wakes the thread's select() to stop or to take an event */
+    wake_pipe_t wake;
     raop_callbacks_t callbacks;
 
     // Time and sync
@@ -174,6 +177,7 @@ raop_rtp_init(logger_t *logger, raop_callbacks_t *callbacks, raop_ntp_t *ntp, co
     }
 
     raop_rtp->running = 0;
+    raop_rtp->wake.fds[0] = raop_rtp->wake.fds[1] = -1;
     raop_rtp->joined = 1;
     raop_rtp->flush = NO_FLUSH;
 
@@ -421,21 +425,31 @@ raop_rtp_thread_udp(void *arg)
             break;
         }
 
-        /* Set timeout value to 5ms */
+        /* Sleep until a packet arrives or the wake pipe is signalled by
+           stop() or an event setter (flush, volume, metadata) */
         tv.tv_sec = 0;
-        tv.tv_usec = 5000;
+        tv.tv_usec = wake_pipe_timeout_usec(&raop_rtp->wake);
 
         /* Get the correct nfds value */
         int nfds = raop_rtp->csock+1;
         if (raop_rtp->dsock >= nfds)
             nfds = raop_rtp->dsock+1;
+        const int wake_fd = raop_rtp->wake.fds[0];
+        if (wake_fd != -1 && wake_fd >= nfds)
+            nfds = wake_fd + 1;
 
         /* Set rfds and call select */
         FD_ZERO(&rfds);
         FD_SET(raop_rtp->csock, &rfds);
         FD_SET(raop_rtp->dsock, &rfds);
+        if (wake_fd != -1)
+            FD_SET(wake_fd, &rfds);
 
         int ret = select(nfds, &rfds, NULL, NULL, &tv);
+        if (ret > 0 && wake_fd != -1 && FD_ISSET(wake_fd, &rfds)) {
+            wake_pipe_drain(&raop_rtp->wake);
+            if (ret == 1) continue;  /* only the pipe: the loop head takes the event */
+        }
         if (ret == 0) {
             /* Timeout happened */
             continue;
@@ -687,6 +701,7 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
     /* Create the thread and initialize running values */
     raop_rtp->running = 1;
     raop_rtp->joined = 0;
+    wake_pipe_open(&raop_rtp->wake);
 
     THREAD_CREATE(raop_rtp->thread, raop_rtp_thread_udp, raop_rtp);
     MUTEX_UNLOCK(raop_rtp->run_mutex);
@@ -708,6 +723,7 @@ raop_rtp_set_volume(raop_rtp_t *raop_rtp, float volume)
     raop_rtp->volume = volume;
     raop_rtp->volume_changed = 1;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 }
 
 void
@@ -730,6 +746,7 @@ raop_rtp_set_metadata(raop_rtp_t *raop_rtp, const char *data, int datalen)
     raop_rtp->metadata = metadata;
     raop_rtp->metadata_len = datalen;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 }
 
 void
@@ -749,6 +766,7 @@ raop_rtp_set_coverart(raop_rtp_t *raop_rtp, const char *data, int datalen)
     raop_rtp->coverart = coverart;
     raop_rtp->coverart_len = datalen;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 }
 
 void
@@ -771,6 +789,7 @@ raop_rtp_remote_control_id(raop_rtp_t *raop_rtp, const char *dacp_id, const char
     }
     raop_rtp->active_remote_header = strdup(active_remote_header);
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 }
 
 void
@@ -785,6 +804,7 @@ raop_rtp_set_progress(raop_rtp_t *raop_rtp, uint32_t start, uint32_t curr, uint3
     raop_rtp->progress_end = end;
     raop_rtp->progress_changed = 1;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 }
 
 void
@@ -796,6 +816,7 @@ raop_rtp_flush(raop_rtp_t *raop_rtp, int next_seq)
     MUTEX_LOCK(raop_rtp->run_mutex);
     raop_rtp->flush = next_seq;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 }
 
 void
@@ -812,9 +833,11 @@ raop_rtp_stop(raop_rtp_t *raop_rtp)
     }
     raop_rtp->running = 0;
     MUTEX_UNLOCK(raop_rtp->run_mutex);
+    wake_pipe_signal(&raop_rtp->wake);
 
     /* Join the thread */
     THREAD_JOIN(raop_rtp->thread);
+    wake_pipe_close(&raop_rtp->wake);
 
     if (raop_rtp->csock != -1) {
         CLOSESOCKET(raop_rtp->csock);

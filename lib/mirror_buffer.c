@@ -125,11 +125,10 @@ void mirror_buffer_decrypt(mirror_buffer_t *mirror_buffer, unsigned char* input,
     // Handling encrypted bytes
     int encryptlen = ((inputLen - mirror_buffer->nextDecryptCount) / 16) * 16;
     // Aes decryption
+    // Aes decryption straight into the output (no in-place pass and copy)
     aes_ctr_start_fresh_block(mirror_buffer->aes_ctx);
     aes_ctr_decrypt(mirror_buffer->aes_ctx, input + mirror_buffer->nextDecryptCount,
-                    input + mirror_buffer->nextDecryptCount, encryptlen);
-    // Copy to output
-    memcpy(output + mirror_buffer->nextDecryptCount, input + mirror_buffer->nextDecryptCount, encryptlen);
+                    output + mirror_buffer->nextDecryptCount, encryptlen);
     // int outputlength = mirror_buffer->nextDecryptCount + encryptlen;
     // Processing remaining length
     int restlen = (inputLen - mirror_buffer->nextDecryptCount) % 16;
