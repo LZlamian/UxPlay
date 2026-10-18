@@ -16,6 +16,7 @@
  */
 
 #include "raop_rtp_mirror.h"
+#include "wake_pipe.h"
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -93,6 +94,9 @@ struct raop_rtp_mirror_s {
     struct sockaddr_storage remote_saddr;
     socklen_t remote_saddr_len;
 
+    /* wakes the thread's select() when it must stop */
+    wake_pipe_t wake;
+
     /* MUTEX LOCKED VARIABLES START */
     /* These variables only edited mutex locked */
     int running;
@@ -159,6 +163,7 @@ raop_rtp_mirror_t *raop_rtp_mirror_init(logger_t *logger, raop_callbacks_t *call
         return NULL;
     }
     raop_rtp_mirror->running = 0;
+    raop_rtp_mirror->wake.fds[0] = raop_rtp_mirror->wake.fds[1] = -1;
     raop_rtp_mirror->joined = 1;
     raop_rtp_mirror->flush = NO_FLUSH;
 
@@ -188,6 +193,10 @@ raop_rtp_mirror_thread(void *arg)
     bool prepend_sps_pps = false;
     int sps_pps_len = 0;
     unsigned char* payload = NULL;
+    /* Received and decrypted payloads, reused for every packet (grown as
+       needed) instead of two malloc/free pairs per video frame. */
+    unsigned char *recv_buffer = NULL, *out_buffer = NULL;
+    size_t recv_capacity = 0, out_capacity = 0;
     unsigned int readstart = 0;
     bool conn_reset = false;
     uint64_t ntp_timestamp_nal = 0;
@@ -217,9 +226,10 @@ raop_rtp_mirror_thread(void *arg)
         }
         MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
 
-        /* Set timeout valu to 5ms */
+        /* Sleep until data arrives or stop() signals the wake pipe (the
+           5 ms poll woke an idle connection 200 times a second) */
         tv.tv_sec = 0;
-        tv.tv_usec = 5000;
+        tv.tv_usec = wake_pipe_timeout_usec(&raop_rtp_mirror->wake);
 
         /* Get the correct nfds value and set rfds */
         FD_ZERO(&rfds);
@@ -231,7 +241,16 @@ raop_rtp_mirror_thread(void *arg)
             FD_SET(stream_fd, &rfds);
             nfds = stream_fd+1;
         }
+        const int wake_fd = raop_rtp_mirror->wake.fds[0];
+        if (wake_fd != -1) {
+            FD_SET(wake_fd, &rfds);
+            if (wake_fd + 1 > nfds) nfds = wake_fd + 1;
+        }
         int ret = select(nfds, &rfds, NULL, NULL, &tv);
+        if (ret > 0 && wake_fd != -1 && FD_ISSET(wake_fd, &rfds)) {
+            wake_pipe_drain(&raop_rtp_mirror->wake);
+            continue;  /* the loop head checks running */
+        }
         if (ret == 0) {
             /* Timeout happened */
             continue;
@@ -380,7 +399,17 @@ raop_rtp_mirror_thread(void *arg)
             /* "streaming report" packets have no timestamp in packet[8:15] */
 
             if (payload == NULL) {
-                payload = malloc(payload_size);
+                if ((size_t) payload_size > recv_capacity) {
+                    unsigned char *grown = realloc(recv_buffer, (size_t) payload_size);
+                    if (!grown) {
+                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR,
+                                   "raop_rtp_mirror: no memory for a %d-byte payload", payload_size);
+                        break;
+                    }
+                    recv_buffer = grown;
+                    recv_capacity = (size_t) payload_size;
+                }
+                payload = recv_buffer;
                 readstart = 0;
             }
 
@@ -449,19 +478,25 @@ raop_rtp_mirror_thread(void *arg)
                         prepend_sps_pps = false;
                 }
 		
-                if (prepend_sps_pps) {
-                    assert(sps_pps);
-                    payload_out = (unsigned char*) malloc(payload_size + sps_pps_len);
-                    if (!payload_out) {
+                const size_t out_needed = (size_t) payload_size + (prepend_sps_pps ? (size_t) sps_pps_len : 0);
+                if (out_needed > out_capacity) {
+                    unsigned char *grown = realloc(out_buffer, out_needed);
+                    if (!grown) {
                         printf("Memory allocation failed (payload_out)\n");
                         exit(1);
                     }
+                    out_buffer = grown;
+                    out_capacity = out_needed;
+                }
+                if (prepend_sps_pps) {
+                    assert(sps_pps);
+                    payload_out = out_buffer;
                     payload_decrypted = payload_out + sps_pps_len;
                     memcpy(payload_out, sps_pps, sps_pps_len);
                     free (sps_pps);
                     sps_pps = NULL;
                 } else {
-                    payload_out = (unsigned char*)  malloc(payload_size);
+                    payload_out = out_buffer;
                     payload_decrypted = payload_out;
                 }
                 // Decrypt data: AES-CTR encryption/decryption  does not change the size of the data
@@ -568,7 +603,6 @@ raop_rtp_mirror_thread(void *arg)
                 }
 
                 raop_rtp_mirror->callbacks.video_process(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, &video_data);
-                free(payload_out);
                 break;
             case 0x01:
                 /* 128-byte observed packet header structure 
@@ -842,8 +876,7 @@ raop_rtp_mirror_thread(void *arg)
                 break;
             }
 
-            free(payload);
-            payload = NULL;
+            payload = NULL;  /* recv_buffer is kept for the next packet */
             memset(packet, 0, 128);
             readstart = 0;
             if (unsupported_codec) {
@@ -851,6 +884,8 @@ raop_rtp_mirror_thread(void *arg)
             }
         }
     }
+    free(recv_buffer);
+    free(out_buffer);
     /* Close the stream file descriptor */
     if (stream_fd != -1) {
         closesocket(stream_fd);
@@ -938,6 +973,7 @@ raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror
     /* Create the thread and initialize running values */
     raop_rtp_mirror->running = 1;
     raop_rtp_mirror->joined = 0;
+    wake_pipe_open(&raop_rtp_mirror->wake);
 
     THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
@@ -955,9 +991,11 @@ void raop_rtp_mirror_stop(raop_rtp_mirror_t *raop_rtp_mirror) {
     }
     raop_rtp_mirror->running = 0;
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
+    wake_pipe_signal(&raop_rtp_mirror->wake);
 
     /* Join the thread */
     THREAD_JOIN(raop_rtp_mirror->thread_mirror);
+    wake_pipe_close(&raop_rtp_mirror->wake);
 
     if (raop_rtp_mirror->mirror_data_sock != -1) {
         closesocket(raop_rtp_mirror->mirror_data_sock);
