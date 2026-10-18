@@ -98,14 +98,24 @@ int fcup_request(void *conn_opaque, const char *media_url, const char *client_se
     free(plist_xml);
 
     const char *http_request = http_response_get_data(request, &requestlen); 
-    int send_len = send(socket_fd, http_request, requestlen, 0);
-    if (send_len < 0) {
-        int sock_err = SOCKET_GET_ERROR();
-	logger_log(raop->logger, LOGGER_ERR, "fcup_request: send  error %d:%s\n",
-		 sock_err, SOCKET_ERROR_STRING(sock_err));
-	http_response_destroy(request);
-        /* shut down connection? */
-        return -1;
+    int send_len = 0;
+    while (send_len < requestlen) {
+        int sent = send(socket_fd, http_request + send_len, requestlen - send_len, 0);
+        if (sent < 0) {
+            int sock_err = SOCKET_GET_ERROR();
+            if (sock_err == SOCKET_ERRORNAME(EINTR)) {
+                continue;
+            }
+            logger_log(raop->logger, LOGGER_ERR, "fcup_request: send error %d:%s after %d of %d bytes",
+                       sock_err, SOCKET_ERROR_STRING(sock_err), send_len, requestlen);
+            http_response_destroy(request);
+            /* The sender stopped reading its reverse channel (the send timed
+               out) or it is gone; a partial request cannot be recovered.
+               Shut it down so httpd removes it on its next select(). */
+            shutdown(socket_fd, SHUT_RDWR);
+            return -1;
+        }
+        send_len += sent;
     }
 
     if (logger_get_level(raop->logger) >= LOGGER_DEBUG) {

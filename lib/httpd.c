@@ -36,6 +36,9 @@
 /* accepted sockets are only read after select(); this bounds any recv()
    that would otherwise block the single httpd thread */
 #define HTTPD_RECV_TIMEOUT_SECONDS 5
+/* a peer that stops reading cannot hold the httpd thread in send() for
+   longer than this; its connection is then closed */
+#define HTTPD_SEND_TIMEOUT_SECONDS 2
 #define HTTPD_RECV_BUFFER_BYTES (64 * 1024)
 #define HTTPD_DEFAULT_BODY_BUDGET_BYTES (256U * 1024U * 1024U)
 
@@ -322,6 +325,22 @@ httpd_accept_connection(httpd_t *httpd, int server_fd, int is_ipv6)
                    "Could not set SO_RCVTIMEO on accepted socket %d: %d",
                    fd, SOCKET_GET_ERROR());
     }
+#ifdef WIN32
+    DWORD send_timeout = HTTPD_SEND_TIMEOUT_SECONDS * 1000;
+#else
+    struct timeval send_timeout = { HTTPD_SEND_TIMEOUT_SECONDS, 0 };
+#endif
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO,
+                   (const char *) &send_timeout, sizeof(send_timeout)) == -1) {
+        logger_log(httpd->logger, LOGGER_WARNING,
+                   "Could not set SO_SNDTIMEO on accepted socket %d: %d",
+                   fd, SOCKET_GET_ERROR());
+    }
+#ifdef SO_NOSIGPIPE
+    /* a peer that has gone away must not raise SIGPIPE in the host */
+    int no_sigpipe = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, (const char *) &no_sigpipe, sizeof(no_sigpipe));
+#endif
 
     local_saddrlen = sizeof(local_saddr);
     ret = getsockname(fd, (struct sockaddr *)&local_saddr, &local_saddrlen);
@@ -686,7 +705,12 @@ httpd_thread(void *arg)
                     while (written < datalen) {
                         ret = send(connection->socket_fd, data+written, datalen-written, 0);
                         if (ret == -1) {
-                            logger_log(httpd->logger, LOGGER_ERR, "httpd error in sending data");
+                            if (SOCKET_GET_ERROR() == SOCKET_ERRORNAME(EINTR)) {
+                                continue;
+                            }
+                            logger_log(httpd->logger, LOGGER_ERR, "httpd error in sending data on "
+                                       "socket %d (%d of %d bytes sent); closing the connection",
+                                       connection->socket_fd, written, datalen);
                             break;
                         }
                         written += ret;
@@ -700,7 +724,10 @@ httpd_thread(void *arg)
                         httpd->callbacks.conn_response_sent(connection->user_data, response);
                     }
 
-                    if (http_response_get_disconnect(response)) {
+                    if (written < datalen) {
+                        /* the peer stopped reading (send timed out) or is gone */
+                        httpd_remove_connection(httpd, connection);
+                    } else if (http_response_get_disconnect(response)) {
                         logger_log(httpd->logger, LOGGER_INFO, "Disconnecting on software request");
                         httpd_remove_connection(httpd, connection);
                     }
