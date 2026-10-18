@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <plist/plist.h>
 
 #define MEDIA_TRACE_MAX_STRING 160
@@ -69,11 +70,59 @@ media_trace_append(media_trace_buf_t *b, const char *fmt, ...) {
     b->buf[b->len] = '\0';
 }
 
+/* URLs in a trace keep scheme, host and path only: query strings and
+   fragments (signed-URL tokens) and user:password@ are replaced, so a trace
+   can be shared without the sender's credentials. */
+static bool
+media_trace_redact_url(const char *s, size_t len, size_t *userinfo_start,
+                       size_t *userinfo_end, size_t *query) {
+    /* only a string that starts with a URL scheme is a URL */
+    const char *sep = NULL;
+    for (size_t i = 0; i + 2 < len; i++) {
+        if (s[i] == ':' && s[i + 1] == '/' && s[i + 2] == '/' && i > 0) {
+            sep = s + i;
+            break;
+        }
+        if (!isalnum((unsigned char) s[i]) && s[i] != '+' && s[i] != '-' && s[i] != '.') break;
+    }
+    const bool blob = len > 5 && !strncasecmp(s, "blob:", 5);
+    if (!sep && !blob) return false;
+    *userinfo_start = *userinfo_end = 0;
+    if (sep) {
+        const size_t authority = (size_t) (sep - s) + 3;
+        size_t end = authority;
+        while (end < len && s[end] != '/' && s[end] != '?' && s[end] != '#') end++;
+        for (size_t i = end; i > authority; i--) {
+            if (s[i - 1] == '@') {
+                *userinfo_start = authority;
+                *userinfo_end = i;
+                break;
+            }
+        }
+    }
+    *query = len;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '?' || s[i] == '#') {
+            *query = i;
+            break;
+        }
+    }
+    return true;
+}
+
 static void
 media_trace_append_string(media_trace_buf_t *b, const char *s, size_t len) {
-    const size_t shown = len > MEDIA_TRACE_MAX_STRING ? MEDIA_TRACE_MAX_STRING : len;
+    size_t userinfo_start = 0, userinfo_end = 0, query = len;
+    const bool url = media_trace_redact_url(s, len, &userinfo_start, &userinfo_end, &query);
+    const size_t limit = url ? query : len;
+    const size_t shown = limit > MEDIA_TRACE_MAX_STRING ? MEDIA_TRACE_MAX_STRING : limit;
     media_trace_append(b, "\"");
     for (size_t i = 0; i < shown; i++) {
+        if (url && userinfo_end && i == userinfo_start) {
+            media_trace_append(b, "[redacted]@");
+            i = userinfo_end - 1;
+            continue;
+        }
         unsigned char c = (unsigned char) s[i];
         if (c == '"' || c == '\\') media_trace_append(b, "\\%c", c);
         else if (c >= 0x20 && c < 0x7f) media_trace_append(b, "%c", c);
@@ -82,8 +131,9 @@ media_trace_append_string(media_trace_buf_t *b, const char *s, size_t len) {
         else if (c >= 0x80) media_trace_append(b, "%c", c); /* keep UTF-8 */
         else media_trace_append(b, "\\x%02x", c);
     }
+    if (url && query < len) media_trace_append(b, "?[redacted]");
     media_trace_append(b, "\"");
-    if (shown < len) media_trace_append(b, "...(%zu chars)", len);
+    if (shown < limit) media_trace_append(b, "...(%zu chars)", len);
 }
 
 static void media_trace_append_plist(media_trace_buf_t *b, plist_t node, int depth);
@@ -321,6 +371,13 @@ media_trace_request(raop_conn_t *conn, http_request_t *request, const char *meth
         char *header_str = NULL;
         http_request_get_header_string(request, &header_str);
         if (header_str) {
+            /* header values that are URLs (Referer, Location, ...) lose
+               their query string and fragment up to the end of the line */
+            for (char *at = strstr(header_str, "://"); at; at = strstr(at + 3, "://")) {
+                char *eol = at + strcspn(at, "\r\n");
+                char *query = at + strcspn(at, "?#\r\n");
+                if (query < eol) memset(query, '*', (size_t) (eol - query));
+            }
             media_trace_buf_t h = {0};
             media_trace_append_string(&h, header_str, strlen(header_str));
             media_trace_emit(raop, "-> headers", &h);
