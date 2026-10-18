@@ -680,8 +680,11 @@ conn_body_limit(void *ptr, http_request_t *request) {
     }
     const char *session = http_request_get_header(request, "X-Apple-Session-ID");
     const char *item_session = get_apple_session_id(airplay_video);
+    /* A connection that has not sent a request yet is bound to the session
+       its first request names (conn_request), so it is enough that this one
+       names the item's session. */
     if (!session || !item_session || strcmp(session, item_session) ||
-        !conn->client_session_id || strcmp(session, conn->client_session_id)) {
+        (conn->client_session_id && strcmp(session, conn->client_session_id))) {
         return 0;
     }
     return MAX_FCUP_ACTION_BYTES;
