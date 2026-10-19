@@ -149,6 +149,12 @@ RAOP_API void raop_set_media_policy(raop_t *raop, bool accept_video, bool sender
 /* Tests only: the spool worker waits this long before writing each
    reverse-fetched file, as a slow disk would make it (obs-airplay). */
 RAOP_API void raop_set_spool_delay_for_testing(raop_t *raop, int milliseconds);
+/* Tests only (fuzzing): run complete HTTP/RTSP requests through the
+ * receiver's handlers on a connection from 127.0.0.1 with no socket.
+ * request returns 1 when the handlers produced a response. */
+RAOP_API void *raop_test_connection_open(raop_t *raop);
+RAOP_API int raop_test_connection_request(void *connection, const char *data, int length);
+RAOP_API void raop_test_connection_close(void *connection);
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
 RAOP_API void raop_set_lang(raop_t *raop, const char *lang);
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);

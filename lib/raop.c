@@ -960,6 +960,45 @@ raop_set_media_ports(raop_t *raop, const unsigned short *ports, int count) {
     }
 }
 
+/* Tests only (obs-airplay fuzzing): a connection from 127.0.0.1 that is not
+   backed by a socket; requests given to it run through the receiver's
+   handlers exactly as the httpd thread runs them. */
+void *
+raop_test_connection_open(raop_t *raop) {
+    unsigned char local[4] = {127, 0, 0, 1};
+    unsigned char remote[4] = {127, 0, 0, 1};
+    return conn_init(raop, local, sizeof(local), remote, sizeof(remote), 0);
+}
+
+int
+raop_test_connection_request(void *connection, const char *data, int length) {
+    raop_conn_t *conn = (raop_conn_t *) connection;
+    if (!conn || !data || length <= 0) return 0;
+    http_body_budget_t budget = {0, 256U * 1024U * 1024U};
+    http_request_t *request = http_request_init();
+    if (!request) return 0;
+    http_request_set_body_policy(request, &budget, conn_body_limit, conn);
+    http_request_add_data(request, data, length);
+    int handled = 0;
+    if (!http_request_has_error(request) && http_request_is_complete(request)) {
+        http_response_t *response = NULL;
+        conn_request(conn, request, &response);
+        if (response) {
+            handled = 1;
+            http_response_destroy(response);
+        }
+    }
+    http_request_destroy(request);
+    /* apply spool files the worker has written, as the httpd thread would */
+    spool_thread_tick(conn->raop);
+    return handled;
+}
+
+void
+raop_test_connection_close(void *connection) {
+    if (connection) conn_destroy(connection);
+}
+
 void
 raop_set_spool_delay_for_testing(raop_t *raop, int milliseconds) {
     MUTEX_LOCK(raop->spool_mutex);
