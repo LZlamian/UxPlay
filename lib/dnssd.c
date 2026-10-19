@@ -39,6 +39,9 @@
 #include "dnssdint.h"
 #include "global.h"
 #include "utils.h"
+#ifdef _WIN32
+#include "dnssd_win32.h"
+#endif
 
 #define MAX_DEVICEID 18
 #define MAX_SERVNAME 256
@@ -121,7 +124,7 @@ typedef const void * (DNSSD_STDCALL *TXTRecordGetBytesPtr_t)(const TXTRecordRef 
 
 struct dnssd_s {
 #ifdef WIN32
-    HMODULE module;
+    HMODULE module;            /* Bonjour's dnssd.dll, or NULL: Windows DNS service */
 #elif USE_LIBDL
     void *module;
 #endif
@@ -195,12 +198,28 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
     dnssd->features2 = (uint32_t) features;
 
 #ifdef WIN32
-    dnssd->module = LoadLibraryA("dnssd.dll");
+    /* Bonjour when it is installed; otherwise the DNS Client service's own
+       mDNS responder (obs-airplay). UXPLAY_DNSSD_BACKEND=bonjour or
+       windows picks one. */
+    const char *backend = getenv("UXPLAY_DNSSD_BACKEND");
+    const bool bonjour_allowed = !backend || strcmp(backend, "windows") != 0;
+    const bool native_allowed = !backend || strcmp(backend, "bonjour") != 0;
+    dnssd->module = bonjour_allowed ? LoadLibraryA("dnssd.dll") : NULL;
 	if (!dnssd->module) {
-		if (error) *error = DNSSD_ERROR_LIBNOTFOUND;
-		free(dnssd);
-		return NULL;
-	}
+		dnssd_win32_functions_t native;
+		if (!native_allowed || !dnssd_win32_native(&native)) {
+			if (error) *error = DNSSD_ERROR_LIBNOTFOUND;
+			free(dnssd);
+			return NULL;
+		}
+		dnssd->DNSServiceRegister = (DNSServiceRegister_t) native.DNSServiceRegister;
+		dnssd->DNSServiceRefDeallocate = (DNSServiceRefDeallocate_t) native.DNSServiceRefDeallocate;
+		dnssd->TXTRecordCreate = (TXTRecordCreate_t) native.TXTRecordCreate;
+		dnssd->TXTRecordSetValue = (TXTRecordSetValue_t) native.TXTRecordSetValue;
+		dnssd->TXTRecordGetLength = (TXTRecordGetLength_t) native.TXTRecordGetLength;
+		dnssd->TXTRecordGetBytesPtr = (TXTRecordGetBytesPtr_t) native.TXTRecordGetBytesPtr;
+		dnssd->TXTRecordDeallocate = (TXTRecordDeallocate_t) native.TXTRecordDeallocate;
+	} else {
 	dnssd->DNSServiceRegister = (DNSServiceRegister_t)GetProcAddress(dnssd->module, "DNSServiceRegister");
 	dnssd->DNSServiceRefDeallocate = (DNSServiceRefDeallocate_t)GetProcAddress(dnssd->module, "DNSServiceRefDeallocate");
 	dnssd->TXTRecordCreate = (TXTRecordCreate_t)GetProcAddress(dnssd->module, "TXTRecordCreate");
@@ -216,6 +235,7 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
 		FreeLibrary(dnssd->module);
 		free(dnssd);
 		return NULL;
+	}
 	}
 #elif USE_LIBDL
     dnssd->module = dlopen("libdns_sd.so", RTLD_LAZY);
@@ -278,7 +298,7 @@ dnssd_destroy(dnssd_t *dnssd)
 {
     if (dnssd) {
 #ifdef WIN32
-        FreeLibrary(dnssd->module);
+        if (dnssd->module) FreeLibrary(dnssd->module);
 #elif USE_LIBDL
         dlclose(dnssd->module);
 #endif
@@ -548,4 +568,15 @@ void dnssd_set_airplay_features(dnssd_t *dnssd, int bit, int val) {
     } else {
         *features = *features & ~mask;
     }
+}
+
+const char *
+dnssd_get_backend(dnssd_t *dnssd) {
+#ifdef WIN32
+    if (dnssd && !dnssd->module) return "Windows DNS service";
+    return "Bonjour";
+#else
+    (void) dnssd;
+    return "system";
+#endif
 }

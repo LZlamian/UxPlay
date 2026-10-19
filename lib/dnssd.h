@@ -51,6 +51,9 @@ DNSSD_API uint64_t dnssd_get_airplay_features(dnssd_t *dnssd);
 DNSSD_API void dnssd_set_airserver_profile(dnssd_t *dnssd, bool enabled);
 DNSSD_API void dnssd_set_pk(dnssd_t *dnssd, char * pk_str);
 
+/* Which DNS-SD implementation registers the services (for logs). */
+DNSSD_API const char *dnssd_get_backend(dnssd_t *dnssd);
+
 DNSSD_API void dnssd_destroy(dnssd_t *dnssd);
 
 #ifdef __cplusplus
