@@ -211,6 +211,9 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
     /* Save callback pointers */
     memcpy(&httpd->callbacks, callbacks, sizeof(httpd_callbacks_t));
     wake_pipe_open(&httpd->wake);
+    /* (obs-airplay) never initialised upstream: a zero-filled pthread mutex
+       is not a valid one on macOS, so locking it did nothing */
+    MUTEX_CREATE(httpd->run_mutex);
 
     /* Initial status joined */
     httpd->running = 0;
@@ -233,6 +236,7 @@ httpd_destroy(httpd_t *httpd)
     if (httpd) {
         httpd_stop(httpd);
         wake_pipe_close(&httpd->wake);
+        MUTEX_DESTROY(httpd->run_mutex);
         free(httpd->connections);
         free(httpd);
     }
