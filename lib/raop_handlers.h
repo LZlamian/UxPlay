@@ -78,7 +78,7 @@ raop_handler_info(raop_conn_t *conn,
         data = http_request_get_data(request, &data_len);
         //parsing bplist
         plist_t req_root_node = NULL;
-        plist_from_bin(data, data_len, &req_root_node);
+        plist_from_bin_checked(data, data_len, &req_root_node);
         plist_t req_qualifier_node = plist_dict_get_item(req_root_node, "qualifier");
         if (PLIST_IS_ARRAY(req_qualifier_node)) {
             plist_t req_string_node = plist_array_get_item(req_qualifier_node, 0);
@@ -321,7 +321,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
 
     /* process the pair-setup-pin request */
     plist_t req_root_node = NULL;
-    plist_from_bin(request_data, request_datalen, &req_root_node);
+    plist_from_bin_checked(request_data, request_datalen, &req_root_node);
     plist_t req_method_node = plist_dict_get_item(req_root_node, "method");
     plist_t req_user_node = plist_dict_get_item(req_root_node, "user");
     plist_t req_pk_node = plist_dict_get_item(req_root_node, "pk");
@@ -655,7 +655,7 @@ raop_handler_setup(raop_conn_t *conn,
 
     // Parsing bplist
     plist_t req_root_node = NULL;
-    plist_from_bin(data, data_len, &req_root_node);
+    plist_from_bin_checked(data, data_len, &req_root_node);
     plist_t req_ekey_node = plist_dict_get_item(req_root_node, "ekey");
     plist_t req_eiv_node = plist_dict_get_item(req_root_node, "eiv");
 	
@@ -1227,7 +1227,7 @@ raop_handler_audiomode(raop_conn_t *conn,
     int data_len = 0;
     data = http_request_get_data(request, &data_len);
     plist_t req_root_node = NULL;
-    plist_from_bin(data, data_len, &req_root_node);
+    plist_from_bin_checked(data, data_len, &req_root_node);
     plist_t req_audiomode_node = plist_dict_get_item(req_root_node, "audioMode");
     plist_get_string_val(req_audiomode_node, &audiomode);
     if (audiomode) {
@@ -1300,7 +1300,7 @@ raop_handler_teardown(raop_conn_t *conn,
     bool teardown_96 = false, teardown_110 = false;
     data = http_request_get_data(request, &data_len);
     plist_t req_root_node = NULL;
-    plist_from_bin(data, data_len, &req_root_node);
+    plist_from_bin_checked(data, data_len, &req_root_node);
     plist_t req_streams_node = plist_dict_get_item(req_root_node, "streams");
     /* Process stream teardown requests */
     if (PLIST_IS_ARRAY(req_streams_node)) {

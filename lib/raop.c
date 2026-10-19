@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 
 #include "raop.h"
+#include "plist_checked.h"
 #include "raop_rtp.h"
 #include "pairing.h"
 #include "httpd.h"
@@ -472,7 +473,7 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
                                request_datalen);
                 } else if (data_is_plist) {
                     plist_t req_root_node = NULL;
-                    plist_from_bin(request_data, request_datalen, &req_root_node);
+                    plist_from_bin_checked(request_data, request_datalen, &req_root_node);
                     char * plist_xml = NULL;
                     char * stripped_xml = NULL;
                     uint32_t plist_len = 0;

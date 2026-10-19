@@ -16,6 +16,7 @@
  */
 
 #include "raop_rtp_mirror.h"
+#include "plist_checked.h"
 #include "wake_pipe.h"
 
 #include <stdlib.h>
@@ -858,7 +859,7 @@ raop_rtp_mirror_thread(void *arg)
                         char *plist_xml = NULL;
                         uint32_t plist_len = 0;
                         plist_t root_node = NULL;
-                        plist_from_bin((char *) payload, plist_size, &root_node);
+                        plist_from_bin_checked((char *) payload, plist_size, &root_node);
                         if (raop_rtp_mirror->show_client_FPS_data) {
                             plist_to_xml(root_node, &plist_xml, &plist_len);
                             logger_log(raop_rtp_mirror->logger, LOGGER_INFO, "%s", plist_xml);

@@ -21,6 +21,7 @@
 #include <string.h>
 #include <strings.h>
 #include <plist/plist.h>
+#include "plist_checked.h"
 
 #define MEDIA_TRACE_MAX_STRING 160
 #define MEDIA_TRACE_MAX_DATA_HEX 24
@@ -142,7 +143,7 @@ static void
 media_trace_append_data(media_trace_buf_t *b, const char *data, uint64_t len, int depth) {
     if (data && len > 8 && !memcmp(data, "bplist00", 8) && depth < MEDIA_TRACE_MAX_DEPTH) {
         plist_t nested = NULL;
-        plist_from_bin(data, (uint32_t) len, &nested);
+        plist_from_bin_checked(data, (uint32_t) len, &nested);
         if (nested) {
             media_trace_append(b, "<bplist %llu bytes>", (unsigned long long) len);
             media_trace_append_plist(b, nested, depth + 1);
@@ -295,8 +296,10 @@ media_trace_append_body(media_trace_buf_t *b, const char *content_type,
     const bool is_xml_plist = content_type && strstr(content_type, "plist+xml");
     if (is_bplist || is_xml_plist) {
         plist_t root = NULL;
-        if (is_bplist) plist_from_bin(data, (uint32_t) datalen, &root);
-        else plist_from_xml(data, (uint32_t) datalen, &root);
+        if (is_bplist) plist_from_bin_checked(data, (uint32_t) datalen, &root);
+        /* (obs-airplay) &#0; would put a NUL in a string: such XML is not
+           parsed for the trace */
+        else if (!memmem(data, (size_t) datalen, "&#", 2)) plist_from_xml(data, (uint32_t) datalen, &root);
         if (root) {
             media_trace_append(b, " body=%s ", is_bplist ? "bplist" : "xml-plist");
             media_trace_append_plist(b, root, 0);

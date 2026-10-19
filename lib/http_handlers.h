@@ -682,7 +682,7 @@ http_handler_set_property(raop_conn_t *conn,
         if (!request_data || request_datalen <= 0) {
             goto post_error;
         }
-        plist_from_bin(request_data, request_datalen, &req_root_node);
+        plist_from_bin_checked(request_data, request_datalen, &req_root_node);
         if (!req_root_node || !PLIST_IS_DICT(req_root_node)) {
             if (req_root_node) plist_free(req_root_node);
             goto post_error;
@@ -756,7 +756,7 @@ http_handler_set_property(raop_conn_t *conn,
             const char *request_data = http_request_get_data(request, &request_datalen);
             plist_t req_root_node = NULL;
             if (request_data && request_datalen > 8 && !memcmp(request_data, "bplist00", 8)) {
-                plist_from_bin(request_data, request_datalen, &req_root_node);
+                plist_from_bin_checked(request_data, request_datalen, &req_root_node);
             }
             plist_t value_node = req_root_node && PLIST_IS_DICT(req_root_node)
                 ? plist_dict_get_item(req_root_node, "value") : NULL;
@@ -1111,7 +1111,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         logger_log(raop->logger, LOGGER_INFO, "POST /action: did not receive expected plist from client");	
         goto post_action_error;
     }
-    plist_from_bin(request_data, request_datalen, &req_root_node);
+    plist_from_bin_checked(request_data, request_datalen, &req_root_node);
     if (!req_root_node || !PLIST_IS_DICT(req_root_node)) {
         goto post_action_error;
     }
@@ -2115,7 +2115,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
          goto play_error;
     }
 
-    plist_from_bin(request_data, request_datalen, &req_root_node);
+    plist_from_bin_checked(request_data, request_datalen, &req_root_node);
     if (!req_root_node) {
         const char *content_length = http_request_get_header(request, "Content-Length");
         char head[3 * 16 + 1] = {0};
