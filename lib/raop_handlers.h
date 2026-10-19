@@ -25,6 +25,15 @@
 #include <inttypes.h>
 #include <plist/plist.h>
 #define AUDIO_SAMPLE_RATE 44100   /* all supported AirPlay audio format use this sample rate */
+
+/* (obs-airplay) The sample rate of the audioFormat a SETUP names (one bit):
+ * the 48 kHz ALAC, AAC-LC and AAC-ELD formats the receiver advertises
+ * (bits 20, 21, 23, 25), otherwise 44.1 kHz. */
+static unsigned int
+audio_format_sample_rate(uint64_t audio_format) {
+    const uint64_t rate_48k = 0x100000ULL | 0x200000ULL | 0x800000ULL | 0x2000000ULL;
+    return (audio_format & rate_48k) ? 48000 : AUDIO_SAMPLE_RATE;
+}
 #define SECOND_IN_USECS 1000000
 #define SECOND_IN_NSECS 1000000000
 #define MAX_PW_ATTEMPTS 3
@@ -1008,7 +1017,7 @@ raop_handler_setup(raop_conn_t *conn,
                 unsigned short cport = raop->control_lport, dport = raop->data_lport; 
                 unsigned short remote_cport = 0;
                 unsigned char ct = 0;
-                unsigned int sr = AUDIO_SAMPLE_RATE; /* all AirPlay audio formats supported so far have sample rate 44.1kHz */
+                unsigned int sr = AUDIO_SAMPLE_RATE;
 
                 uint64_t uint_val = 0;
                 plist_t req_stream_control_port_node = plist_dict_get_item(req_stream_node, "controlPort");
@@ -1019,20 +1028,26 @@ raop_handler_setup(raop_conn_t *conn,
                 plist_get_uint_val(req_stream_ct_node, &uint_val);
                 ct = (unsigned char) uint_val;
 
+                /* (obs-airplay) the RTP clock runs at the negotiated rate */
+                uint64_t audioFormat = 0;
+                plist_t req_stream_audio_format_node = plist_dict_get_item(req_stream_node, "audioFormat");
+                if (req_stream_audio_format_node) {
+                    plist_get_uint_val(req_stream_audio_format_node, &audioFormat);
+                }
+                sr = audio_format_sample_rate(audioFormat);
+                raop->audio_sample_rate = sr;
+
                 if (raop->callbacks.audio_get_format) {
                     /* get additional audio format parameters  */
-                    uint64_t audioFormat = 0;
                     unsigned short spf = 0;
                     bool isMedia = false;
                     bool usingScreen = false;
                     uint8_t bool_val = 0;
 
                     plist_t req_stream_spf_node = plist_dict_get_item(req_stream_node, "spf");
+                    uint_val = 0;
                     plist_get_uint_val(req_stream_spf_node, &uint_val);
                     spf = (unsigned short) uint_val;
-
-                    plist_t req_stream_audio_format_node = plist_dict_get_item(req_stream_node, "audioFormat");
-                    plist_get_uint_val(req_stream_audio_format_node, &audioFormat);
 
                     plist_t req_stream_is_media_node = plist_dict_get_item(req_stream_node, "isMedia");
                     if (req_stream_is_media_node) {
@@ -1242,7 +1257,8 @@ raop_handler_record(raop_conn_t *conn,
 {
     raop_t *raop = conn->raop;
     char audio_latency[12] = { '\0' };
-    unsigned int ad = (unsigned int) (((uint64_t) raop->audio_delay_micros) * AUDIO_SAMPLE_RATE / SECOND_IN_USECS);
+    const unsigned int rate = raop->audio_sample_rate ? raop->audio_sample_rate : AUDIO_SAMPLE_RATE;
+    unsigned int ad = (unsigned int) (((uint64_t) raop->audio_delay_micros) * rate / SECOND_IN_USECS);
     snprintf(audio_latency, sizeof(audio_latency), "%u", ad);
     logger_log(raop->logger, LOGGER_DEBUG, "raop_handler_record");
     http_response_add_header(response, "Audio-Latency", audio_latency);

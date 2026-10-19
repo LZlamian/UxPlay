@@ -63,6 +63,9 @@ struct raop_s {
     unsigned long long spool_pending_bytes;
     int spool_delay_for_testing_ms;
 
+    /* obs-airplay: the sample rate of the audio format negotiated at SETUP */
+    unsigned int audio_sample_rate;
+
     /* Logger instance */
     logger_t *logger;
 
