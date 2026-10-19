@@ -38,6 +38,10 @@ struct httpd_callbacks_s {
     void  (*conn_destroy)(void *ptr);
     /* optional: body limit for a request whose headers are in (0 = default) */
     size_t (*conn_body_limit)(void *ptr, http_request_t *request);
+    /* optional (obs-airplay): runs on the httpd thread after httpd_wake()
+       and at least once a second, so work finished by other threads can be
+       applied where the receiver's state lives */
+    void  (*thread_tick)(void *opaque);
 };
 typedef struct httpd_callbacks_s httpd_callbacks_t;
 bool httpd_nohold(httpd_t *httpd);
@@ -53,6 +57,8 @@ int httpd_get_connection_socket_by_type (httpd_t *httpd, connection_type_t type,
 const char *httpd_get_connection_typename (connection_type_t type);
 void *httpd_get_connection_by_type (httpd_t *httpd, connection_type_t type, int instance);
 httpd_t *httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int  nohold);
+/* any thread: run the thread_tick callback soon */
+void httpd_wake(httpd_t *httpd);
 
 int httpd_is_running(httpd_t *httpd);
 

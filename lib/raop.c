@@ -43,9 +43,25 @@ static void plist_mem_free(void *ptr) {
 }
 #endif
 
+typedef struct spool_job_s spool_job_t;
+
 struct raop_s {
     /* Callbacks for audio and video */
     raop_callbacks_t callbacks;
+
+    /* obs-airplay: reverse-fetched media is written to its spool file by a
+       worker thread, so the httpd thread never waits on the disk; the
+       finished file is applied on the httpd thread (thread_tick). */
+    mutex_handle_t spool_mutex;
+    cond_handle_t spool_cond;
+    thread_handle_t spool_thread;
+    bool spool_thread_running;
+    bool spool_quit;
+    spool_job_t *spool_queue;          /* waiting to be written */
+    spool_job_t *spool_done;           /* written, to be applied */
+    airplay_video_t *spool_writing_video;
+    unsigned long long spool_pending_bytes;
+    int spool_delay_for_testing_ms;
 
     /* Logger instance */
     logger_t *logger;
@@ -771,6 +787,8 @@ raop_init(raop_callbacks_t *callbacks) {
     if (!raop) {
         return NULL;
     }
+    MUTEX_CREATE(raop->spool_mutex);
+    COND_CREATE(raop->spool_cond);
 
     /* Initialize the logger */
     raop->logger = logger_init();
@@ -865,6 +883,7 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
     httpd_cbs.conn_response_sent = &conn_response_sent;
     httpd_cbs.conn_destroy = &conn_destroy;
     httpd_cbs.conn_body_limit = &conn_body_limit;
+    httpd_cbs.thread_tick = &spool_thread_tick;
 
     /* Initialize the http daemon, (this will take a copy of httpd_cbs) */
     httpd = httpd_init(raop->logger, &httpd_cbs, nohold);
@@ -882,6 +901,7 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
 void
 raop_destroy(raop_t *raop) {
     if (raop) {
+        spool_shutdown(raop);
         raop_destroy_airplay_video(raop, -1);
         raop_stop_httpd(raop);
         pairing_destroy(raop->pairing);
@@ -898,6 +918,8 @@ raop_destroy(raop_t *raop) {
             free(raop->lang);
         }
 
+        MUTEX_DESTROY(raop->spool_mutex);
+        COND_DESTROY(raop->spool_cond);
         free(raop);
 
         /* Cleanup the network */
@@ -932,6 +954,13 @@ raop_set_media_ports(raop_t *raop, const unsigned short *ports, int count) {
     for (int i = 0; ports && i < count && raop->media_port_count < RAOP_MAX_MEDIA_PORTS; ++i) {
         if (ports[i]) raop->media_ports[raop->media_port_count++] = ports[i];
     }
+}
+
+void
+raop_set_spool_delay_for_testing(raop_t *raop, int milliseconds) {
+    MUTEX_LOCK(raop->spool_mutex);
+    raop->spool_delay_for_testing_ms = milliseconds > 0 ? milliseconds : 0;
+    MUTEX_UNLOCK(raop->spool_mutex);
 }
 
 void

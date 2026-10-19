@@ -146,6 +146,9 @@ RAOP_API void raop_set_media_ports(raop_t *raop, const unsigned short *ports, in
  * unaffected).  sender_only: a POST /play URL must be the sender's own
  * address.  Both apply to the next request. */
 RAOP_API void raop_set_media_policy(raop_t *raop, bool accept_video, bool sender_only);
+/* Tests only: the spool worker waits this long before writing each
+   reverse-fetched file, as a slow disk would make it (obs-airplay). */
+RAOP_API void raop_set_spool_delay_for_testing(raop_t *raop, int milliseconds);
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
 RAOP_API void raop_set_lang(raop_t *raop, const char *lang);
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);

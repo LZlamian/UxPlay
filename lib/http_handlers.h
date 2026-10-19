@@ -66,9 +66,9 @@ is_iso_bmff_media(const char *data, size_t size) {
 }
 
 static void
-log_spool_failure(raop_t *raop, const char *stage, int error_number) {
+log_spool_failure(logger_t *logger, const char *stage, int error_number) {
     if (!error_number) error_number = EIO;
-    logger_log(raop->logger, LOGGER_ERR,
+    logger_log(logger, LOGGER_ERR,
                "[MEDIA] blob spool failed stage=%s errno=%d (%s)",
                stage, error_number, strerror(error_number));
 }
@@ -181,13 +181,18 @@ sweep_stale_spool_files(raop_t *raop) {
     }
 }
 
-static char *
-spool_reverse_media(raop_t *raop, const char *data, size_t size) {
-    if (!data || !size || size > MAX_FCUP_MEDIA_BYTES) {
-        log_spool_failure(raop, "validate", EINVAL);
-        return NULL;
+/* httpd thread: room in the spool budget for `size` more bytes, counting the
+   files of every item and the replies still being written (obs-airplay) */
+static bool
+spool_budget_allows(raop_t *raop, size_t size) {
+    logger_t *logger = raop->logger;
+    if (!size || size > MAX_FCUP_MEDIA_BYTES) {
+        log_spool_failure(logger, "validate", EINVAL);
+        return false;
     }
-    unsigned long long spooled = 0;
+    MUTEX_LOCK(raop->spool_mutex);
+    unsigned long long spooled = raop->spool_pending_bytes;
+    MUTEX_UNLOCK(raop->spool_mutex);
     for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
         const char *existing = raop->airplay_video[i]
             ? get_spooled_media_path(raop->airplay_video[i]) : NULL;
@@ -201,10 +206,25 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
                    "[MEDIA] spooling %zu more bytes would exceed the %llu MiB spool budget "
                    "(%llu MiB in use)", size, MAX_SPOOL_TOTAL_BYTES / (1024ULL * 1024ULL),
                    spooled / (1024ULL * 1024ULL));
-        log_spool_failure(raop, "budget", ENOSPC);
+        log_spool_failure(logger, "budget", ENOSPC);
+        return false;
+    }
+    return true;
+}
+
+/* Writes reverse-fetched media to a new private spool file and returns its
+   path (caller frees), or NULL. Touches no receiver state, so it runs on the
+   spool worker thread, never on the httpd thread (obs-airplay).
+   delay_ms (tests only) makes the write as slow as a slow disk. */
+static char *
+spool_write_media(logger_t *logger, const char *data, size_t size, int delay_ms) {
+    if (delay_ms > 0) {
+        sleepms(delay_ms);
+    }
+    if (!data || !size || size > MAX_FCUP_MEDIA_BYTES) {
+        log_spool_failure(logger, "validate", EINVAL);
         return NULL;
     }
-
     char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
     const char *candidates[3] = {NULL, NULL, NULL};
     const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
@@ -218,30 +238,30 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
                                          directory,
                                          directory[strlen(directory) - 1] == '/' ? "" : "/");
         if (path_length <= 0 || (size_t) path_length >= sizeof(path)) {
-            log_spool_failure(raop, "path", ENAMETOOLONG);
+            log_spool_failure(logger, "path", ENAMETOOLONG);
             continue;
         }
 
         errno = 0;
         int fd = mkstemp(path);
         if (fd < 0) {
-            log_spool_failure(raop, "mkstemp", errno);
+            log_spool_failure(logger, "mkstemp", errno);
             continue;
         }
-        logger_log(raop->logger, LOGGER_INFO,
+        logger_log(logger, LOGGER_INFO,
                    "[MEDIA] blob spool using validated temp directory %s",
                    directory);
 
         bool failed = false;
         if (fchmod(fd, S_IRUSR | S_IWUSR) < 0) {
-            log_spool_failure(raop, "fchmod", errno);
+            log_spool_failure(logger, "fchmod", errno);
             failed = true;
         }
         if (!failed) {
             const int descriptor_flags = fcntl(fd, F_GETFD);
             if (descriptor_flags < 0 ||
                 fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
-                log_spool_failure(raop, "fcntl", errno);
+                log_spool_failure(logger, "fcntl", errno);
                 failed = true;
             }
         }
@@ -254,7 +274,7 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
             const ssize_t result = write(fd, data + written, chunk);
             if (result < 0 && errno == EINTR) continue;
             if (result <= 0) {
-                log_spool_failure(raop, "write", result < 0 ? errno : EIO);
+                log_spool_failure(logger, "write", result < 0 ? errno : EIO);
                 failed = true;
                 break;
             }
@@ -262,7 +282,7 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
         }
 
         if (close(fd) < 0) {
-            log_spool_failure(raop, "close", errno);
+            log_spool_failure(logger, "close", errno);
             failed = true;
         }
         if (failed) {
@@ -273,7 +293,7 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
         errno = 0;
         char *copy = strdup(path);
         if (!copy) {
-            log_spool_failure(raop, "strdup", errno ? errno : ENOMEM);
+            log_spool_failure(logger, "strdup", errno ? errno : ENOMEM);
             unlink(path);
             continue;
         }
@@ -281,6 +301,200 @@ spool_reverse_media(raop_t *raop, const char *data, size_t size) {
     }
 
     return NULL;
+}
+
+/* A reverse-fetched media reply waiting to be written, being written, or
+   written and waiting to be applied on the httpd thread (obs-airplay). */
+struct spool_job_s {
+    struct spool_job_s *next;
+    airplay_video_t *video;  /* compared, never dereferenced, off the httpd thread */
+    int video_id;
+    char *url;               /* the item's reverse-fetch URL */
+    plist_t owner;           /* keeps `data` alive (libplist >= 2.1) */
+    char *owned;             /* or a copy of it (older libplist) */
+    const char *data;
+    size_t size;
+    char *path;              /* the spool file, once written; NULL if writing failed */
+    double write_ms;
+};
+
+static void
+spool_job_release_data(spool_job_t *job) {
+    if (job->owner) plist_free(job->owner);
+    if (job->owned) plist_mem_free(job->owned);
+    job->owner = NULL;
+    job->owned = NULL;
+    job->data = NULL;
+}
+
+static void
+spool_job_free(spool_job_t *job) {
+    if (!job) return;
+    spool_job_release_data(job);
+    free(job->url);
+    free(job->path);
+    free(job);
+}
+
+static THREAD_RETVAL
+spool_worker_thread(void *arg) {
+    raop_t *raop = (raop_t *) arg;
+    MUTEX_LOCK(raop->spool_mutex);
+    while (!raop->spool_quit) {
+        spool_job_t *job = raop->spool_queue;
+        if (!job) {
+            pthread_cond_wait(&raop->spool_cond, &raop->spool_mutex);
+            continue;
+        }
+        raop->spool_queue = job->next;
+        job->next = NULL;
+        raop->spool_writing_video = job->video;
+        const int delay_ms = raop->spool_delay_for_testing_ms;
+        MUTEX_UNLOCK(raop->spool_mutex);
+
+        struct timespec started, finished;
+        clock_gettime(CLOCK_MONOTONIC, &started);
+        job->path = spool_write_media(raop->logger, job->data, job->size, delay_ms);
+        clock_gettime(CLOCK_MONOTONIC, &finished);
+        job->write_ms = (double) (finished.tv_sec - started.tv_sec) * 1000.0 +
+                        (double) (finished.tv_nsec - started.tv_nsec) / 1e6;
+        spool_job_release_data(job);
+
+        MUTEX_LOCK(raop->spool_mutex);
+        raop->spool_writing_video = NULL;
+        spool_job_t **tail = &raop->spool_done;
+        while (*tail) tail = &(*tail)->next;
+        *tail = job;
+        MUTEX_UNLOCK(raop->spool_mutex);
+        httpd_wake(raop->httpd);
+        MUTEX_LOCK(raop->spool_mutex);
+    }
+    MUTEX_UNLOCK(raop->spool_mutex);
+    return 0;
+}
+
+/* httpd thread: hands a reply to the spool worker, starting it on first use.
+   Takes the job; false (job freed) if the worker cannot be started. */
+static bool
+spool_enqueue(raop_t *raop, spool_job_t *job) {
+    MUTEX_LOCK(raop->spool_mutex);
+    if (!raop->spool_thread_running) {
+        raop->spool_quit = false;
+        if (pthread_create(&raop->spool_thread, NULL, spool_worker_thread, raop) != 0) {
+            MUTEX_UNLOCK(raop->spool_mutex);
+            log_spool_failure(raop->logger, "thread", errno ? errno : EAGAIN);
+            spool_job_free(job);
+            return false;
+        }
+        raop->spool_thread_running = true;
+    }
+    spool_job_t **tail = &raop->spool_queue;
+    while (*tail) tail = &(*tail)->next;
+    *tail = job;
+    raop->spool_pending_bytes += job->size;
+    pthread_cond_signal(&raop->spool_cond);
+    MUTEX_UNLOCK(raop->spool_mutex);
+    return true;
+}
+
+/* httpd thread: a reply for this item is already queued or being written */
+static bool
+spool_job_pending_for(raop_t *raop, airplay_video_t *video) {
+    bool pending = false;
+    MUTEX_LOCK(raop->spool_mutex);
+    for (spool_job_t *job = raop->spool_queue; job && !pending; job = job->next) {
+        pending = job->video == video;
+    }
+    for (spool_job_t *job = raop->spool_done; job && !pending; job = job->next) {
+        pending = job->video == video;
+    }
+    if (!pending && raop->spool_writing_video == video && video) pending = true;
+    MUTEX_UNLOCK(raop->spool_mutex);
+    return pending;
+}
+
+/* httpd thread: start playing a written spool file, if its item is still
+   the current one waiting for it; otherwise remove the file */
+static void
+spool_apply(raop_t *raop, spool_job_t *job) {
+    MUTEX_LOCK(raop->spool_mutex);
+    raop->spool_pending_bytes -= job->size;
+    MUTEX_UNLOCK(raop->spool_mutex);
+
+    airplay_video_t *video = (job->video_id >= 0 && job->video_id < MAX_AIRPLAY_VIDEO)
+        ? raop->airplay_video[job->video_id] : NULL;
+    const char *location = video == job->video && video ? get_playback_location(video) : NULL;
+    const bool current = video && video == job->video && raop->current_video == job->video_id &&
+        get_reverse_media_pending(video) && location && job->url && !strcmp(location, job->url);
+    if (!current) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] spooled reverse-fetched media is no longer wanted (item stopped "
+                   "or replaced); removing it");
+        if (job->path) unlink(job->path);
+        return;
+    }
+    if (!job->path || !set_spooled_media_path(video, job->path, strlen(job->path))) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] reverse sender-local media could not be spooled (%zu bytes)",
+                   job->size);
+        if (job->path) unlink(job->path);
+        raop->callbacks.on_video_stop(raop->callbacks.cls);
+        raop_destroy_airplay_video(raop, job->video_id);
+        return;
+    }
+    set_playback_location(video, job->path, strlen(job->path));
+    set_reverse_media_pending(video, false);
+    set_reverse_media_request_sent(video, false);
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] reverse-fetched sender-local media spooled securely "
+               "(%zu bytes, written in %.0f ms off the network thread); starting playback",
+               job->size, job->write_ms);
+    raop->callbacks.on_video_play(raop->callbacks.cls, get_playback_location(video),
+                                  get_start_position_seconds(video));
+}
+
+/* httpd thread_tick: applies the replies the worker has written */
+static void
+spool_thread_tick(void *opaque) {
+    raop_t *raop = (raop_t *) opaque;
+    MUTEX_LOCK(raop->spool_mutex);
+    spool_job_t *done = raop->spool_done;
+    raop->spool_done = NULL;
+    MUTEX_UNLOCK(raop->spool_mutex);
+    while (done) {
+        spool_job_t *next = done->next;
+        spool_apply(raop, done);
+        spool_job_free(done);
+        done = next;
+    }
+}
+
+/* Stops the worker (waiting for a file being written) and discards every
+   job, removing files that were written but not applied. */
+static void
+spool_shutdown(raop_t *raop) {
+    MUTEX_LOCK(raop->spool_mutex);
+    const bool running = raop->spool_thread_running;
+    raop->spool_quit = true;
+    pthread_cond_signal(&raop->spool_cond);
+    MUTEX_UNLOCK(raop->spool_mutex);
+    if (running) {
+        THREAD_JOIN(raop->spool_thread);
+    }
+    MUTEX_LOCK(raop->spool_mutex);
+    raop->spool_thread_running = false;
+    spool_job_t *lists[2] = {raop->spool_queue, raop->spool_done};
+    raop->spool_queue = raop->spool_done = NULL;
+    raop->spool_pending_bytes = 0;
+    MUTEX_UNLOCK(raop->spool_mutex);
+    for (int i = 0; i < 2; i++) {
+        for (spool_job_t *job = lists[i]; job;) {
+            spool_job_t *next = job->next;
+            if (job->path) unlink(job->path);
+            spool_job_free(job);
+            job = next;
+        }
+    }
 }
 
 static void
@@ -1055,57 +1269,70 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
             const bool format_ok = size_ok &&
                 is_iso_bmff_media(fcup_response_data, (size_t) fcup_response_datalen);
 
-            char *spooled_path = NULL;
-            const bool spool_attempted = url_matches && status_ok && format_ok;
+            /* A sender may repeat its reply; one is enough. */
+            if (spool_job_pending_for(raop, airplay_video)) {
+                logger_log(raop->logger, LOGGER_INFO,
+                           "[MEDIA] reverse-fetch reply already being spooled; ignoring the repeat");
+#ifndef PLIST_210
+                plist_mem_free(fcup_response_data);
+#endif
+                plist_mem_free(fcup_response_url);
+                goto post_action_success;
+            }
+
+            /* The file is written by the spool worker (spool_write_media) so
+               this thread keeps serving requests; spool_apply starts playback
+               here once it is written (obs-airplay). */
+            const bool spool_attempted = url_matches && status_ok && format_ok &&
+                spool_budget_allows(raop, (size_t) fcup_response_datalen);
+            bool spool_queued = false;
             if (spool_attempted) {
-                spooled_path = spool_reverse_media(raop, fcup_response_data,
-                                                   (size_t) fcup_response_datalen);
+                spool_job_t *job = (spool_job_t *) calloc(1, sizeof(spool_job_t));
+                char *job_url = strdup(fcup_response_url);
+                if (job && job_url) {
+                    job->video = airplay_video;
+                    job->video_id = raop->current_video;
+                    job->url = job_url;
+                    job->data = fcup_response_data;
+                    job->size = (size_t) fcup_response_datalen;
+#ifdef PLIST_210
+                    /* the data lives in the request plist: the job keeps it */
+                    job->owner = req_root_node;
+                    req_root_node = NULL;
+#else
+                    job->owned = fcup_response_data;
+                    fcup_response_data = NULL;
+#endif
+                    spool_queued = spool_enqueue(raop, job);
+                } else {
+                    free(job_url);
+                    free(job);
+                }
             }
 #ifndef PLIST_210
-            plist_mem_free(fcup_response_data);
+            if (fcup_response_data) plist_mem_free(fcup_response_data);
 #endif
 
-            if (!url_matches || !status_ok || !size_ok || !format_ok || !spooled_path) {
+            if (!spool_queued) {
                 logger_log(raop->logger, LOGGER_ERR,
                            "[MEDIA] reverse sender-local media fetch unusable "
                            "(url_match=%d request_id=%d expected=%d request_id_ok=%d "
                            "status_present=%d status=%d status_ok=%d "
-                           "bytes=%d iso_bmff=%d spool_attempted=%d spool=%d)",
+                           "bytes=%d iso_bmff=%d spool_attempted=%d)",
                            url_matches, request_id, expected_request_id, request_id_matches,
                            fcup_response_status_present,
                            fcup_response_statuscode, status_ok, fcup_response_datalen,
-                           format_ok, spool_attempted, spooled_path != NULL);
-                free(spooled_path);
+                           format_ok, spool_attempted);
                 plist_mem_free(fcup_response_url);
                 raop->callbacks.on_video_stop(raop->callbacks.cls);
                 const int failed_id = raop->current_video;
                 if (failed_id >= 0) raop_destroy_airplay_video(raop, failed_id);
                 goto post_action_error;
             }
-
-            if (!set_spooled_media_path(airplay_video, spooled_path,
-                                        strlen(spooled_path))) {
-                logger_log(raop->logger, LOGGER_ERR,
-                           "[MEDIA] could not retain reverse-fetched media path");
-                unlink(spooled_path);
-                free(spooled_path);
-                plist_mem_free(fcup_response_url);
-                raop->callbacks.on_video_stop(raop->callbacks.cls);
-                const int failed_id = raop->current_video;
-                if (failed_id >= 0) raop_destroy_airplay_video(raop, failed_id);
-                goto post_action_error;
-            }
-            set_playback_location(airplay_video, spooled_path, strlen(spooled_path));
-            set_reverse_media_pending(airplay_video, false);
-            set_reverse_media_request_sent(airplay_video, false);
             logger_log(raop->logger, LOGGER_INFO,
-                       "[MEDIA] reverse-fetched sender-local media spooled securely "
-                       "(%d bytes); starting playback",
+                       "[MEDIA] reverse-fetched sender-local media received (%d bytes); "
+                       "spooling it off the network thread",
                        fcup_response_datalen);
-            raop->callbacks.on_video_play(raop->callbacks.cls,
-                                          get_playback_location(airplay_video),
-                                          get_start_position_seconds(airplay_video));
-            free(spooled_path);
             plist_mem_free(fcup_response_url);
             goto post_action_success;
         }
@@ -1201,7 +1428,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     }
  post_action_success:;
     if (type) plist_mem_free(type);
-    plist_free(req_root_node);
+    if (req_root_node) plist_free(req_root_node);  /* may have gone to a spool job */
     return;
 
  post_action_error:;

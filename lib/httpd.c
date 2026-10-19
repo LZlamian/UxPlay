@@ -29,6 +29,7 @@
 #include "compat.h"
 #include "logger.h"
 #include "utils.h"
+#include "wake_pipe.h"
 
 /* drop a connection that stalls mid-request (or never identifies itself)
    for this long; idle keep-alive connections between requests are kept */
@@ -83,6 +84,9 @@ struct httpd_s {
 
     /* request bodies buffered across all connections (httpd thread only) */
     http_body_budget_t body_budget;
+
+    /* httpd_wake(): makes select() return so thread_tick runs */
+    wake_pipe_t wake;
 };
 
 const char *
@@ -206,6 +210,7 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
 
     /* Save callback pointers */
     memcpy(&httpd->callbacks, callbacks, sizeof(httpd_callbacks_t));
+    wake_pipe_open(&httpd->wake);
 
     /* Initial status joined */
     httpd->running = 0;
@@ -215,10 +220,19 @@ httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
 }
 
 void
+httpd_wake(httpd_t *httpd)
+{
+    if (httpd) {
+        wake_pipe_signal(&httpd->wake);
+    }
+}
+
+void
 httpd_destroy(httpd_t *httpd)
 {
     if (httpd) {
         httpd_stop(httpd);
+        wake_pipe_close(&httpd->wake);
         free(httpd->connections);
         free(httpd);
     }
@@ -460,6 +474,10 @@ httpd_thread(void *arg)
 
         /* Get the correct nfds value and set rfds */
         FD_ZERO(&rfds);
+        if (httpd->wake.fds[0] != -1) {
+            FD_SET(httpd->wake.fds[0], &rfds);
+            nfds = httpd->wake.fds[0] + 1;
+        }
         if (httpd->open_connections < httpd->max_connections) {
             if (httpd->server_fd4 != -1) {
                 FD_SET(httpd->server_fd4, &rfds);
@@ -496,6 +514,13 @@ httpd_thread(void *arg)
             logger_log(httpd->logger, LOGGER_ERR,
                        "httpd error in select: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
             break;
+        }
+
+        if (httpd->wake.fds[0] != -1 && FD_ISSET(httpd->wake.fds[0], &rfds)) {
+            wake_pipe_drain(&httpd->wake);
+        }
+        if (httpd->callbacks.thread_tick) {
+            httpd->callbacks.thread_tick(httpd->callbacks.opaque);
         }
 
         /* remove dead connections: never identified, or stalled part-way
