@@ -103,8 +103,6 @@ netutils_init_socket(unsigned short *port, int use_ipv6, int use_udp)
     socklen_t socklen = 0;
 #ifndef _WIN32
     int reuseaddr = 1;
-#else
-    const char reuseaddr = 1;
 #endif
     
     assert(port);
@@ -114,7 +112,15 @@ netutils_init_socket(unsigned short *port, int use_ipv6, int use_udp)
         goto cleanup;
     }
 
+#ifndef _WIN32
     int ret = setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr, sizeof (reuseaddr));
+#else
+    /* (obs-airplay) SO_REUSEADDR on Windows lets this bind a port another
+       program is listening on (connections then split between the two);
+       exclusive use makes bind fail so the caller can pick another port */
+    const BOOL exclusive = TRUE;
+    int ret = setsockopt(server_fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char *) &exclusive, sizeof (exclusive));
+#endif
     if (ret == -1) {
         goto cleanup;
     }
