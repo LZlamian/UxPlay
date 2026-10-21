@@ -23,6 +23,7 @@
 
 #define TXT_MAX_ITEMS 64
 #define DEREGISTER_WAIT_MS 2000
+#define DEREGISTER_POLL_MS 10
 
 typedef PDNS_SERVICE_INSTANCE (WINAPI *construct_instance_t)(PCWSTR, PCWSTR, PIP4_ADDRESS,
                                                              PIP6_ADDRESS, WORD, WORD, WORD,
@@ -35,12 +36,16 @@ static register_t service_register;
 static register_t service_deregister;
 static free_instance_t free_instance;
 
-/* dns_sd.h leaves the service reference opaque; this is ours. */
+/* dns_sd.h leaves the service reference opaque; this is ours.
+   Registration and deregistration report through the same callback, in
+   either order: the service is freed only when no callback is still to
+   come, which the callback's last access (the decrement) tells. */
 struct _DNSServiceRef_t {
     DNS_SERVICE_REGISTER_REQUEST request;
     PDNS_SERVICE_INSTANCE instance;
-    HANDLE completed;            /* set by every completion callback */
-    volatile LONG status;        /* last completion status */
+    volatile LONG outstanding;   /* completion callbacks still to come */
+    volatile LONG answered;      /* the registration's callback has run */
+    volatile LONG status;        /* its status */
 };
 
 /* TXTRecordRef is 16 opaque bytes: they hold a pointer to this. */
@@ -125,16 +130,43 @@ static void WINAPI
 register_complete(DWORD status, PVOID context, PDNS_SERVICE_INSTANCE instance) {
     DNSServiceRef service = context;
     if (instance) free_instance(instance);  /* the callback owns this copy */
-    InterlockedExchange(&service->status, (LONG) status);
-    SetEvent(service->completed);
+    /* The first callback answers the registration. */
+    if (InterlockedCompareExchange(&service->answered, 1, 0) == 0) {
+        InterlockedExchange(&service->status, (LONG) status);
+    }
+    /* Last access: the service may be freed as soon as this reaches 0. */
+    InterlockedDecrement(&service->outstanding);
 }
 
 static void
 service_free(DNSServiceRef service) {
     if (!service) return;
     if (service->instance) free_instance(service->instance);
-    if (service->completed) CloseHandle(service->completed);
     free(service);
+}
+
+long
+dnssd_win32_registration_status(DNSServiceRef service) {
+    if (!service) return 0;
+    if (!InterlockedCompareExchange(&service->answered, 0, 0)) return -1;
+    return (long) InterlockedCompareExchange(&service->status, 0, 0);
+}
+
+/* A label of the instance name: DnsServiceConstructInstance splits the
+   whole name at every '.', so a dot in it becomes U+2024 ONE DOT LEADER,
+   which looks the same. Bonjour escapes dots itself. */
+static bool
+instance_label(const char *name, char *label, size_t size) {
+    size_t length = 0;
+    for (const char *c = name; *c; ++c) {
+        const char *part = *c == '.' ? "\xe2\x80\xa4" : c;
+        const size_t part_length = *c == '.' ? 3U : 1U;
+        if (length + part_length >= size) return false;
+        memcpy(label + length, part, part_length);
+        length += part_length;
+    }
+    label[length] = '\0';
+    return length > 0;
 }
 
 static DNSServiceErrorType DNSSD_API
@@ -150,8 +182,10 @@ native_register(DNSServiceRef *reference, DNSServiceFlags flags, uint32_t interf
     if (!name || !type) return kDNSServiceErr_BadParam;
 
     /* "<name>.<type>.<domain>" and "<computer>.local" */
-    char instance_name[512];
-    const int written = snprintf(instance_name, sizeof(instance_name), "%s.%s.%s", name, type,
+    char label[256 * 3];
+    if (!instance_label(name, label, sizeof(label))) return kDNSServiceErr_BadParam;
+    char instance_name[1024];
+    const int written = snprintf(instance_name, sizeof(instance_name), "%s.%s.%s", label, type,
                                  domain && *domain ? domain : "local");
     if (written <= 0 || (size_t) written >= sizeof(instance_name)) return kDNSServiceErr_BadParam;
     wchar_t computer[256];
@@ -194,8 +228,7 @@ native_register(DNSServiceRef *reference, DNSServiceFlags flags, uint32_t interf
     if (!error && !wide_name) error = kDNSServiceErr_BadParam;
     if (!error) {
         service = calloc(1, sizeof(*service));
-        if (service) service->completed = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (!service || !service->completed) error = kDNSServiceErr_NoMemory;
+        if (!service) error = kDNSServiceErr_NoMemory;
     }
     if (!error) {
         /* the port arrives in network byte order */
@@ -211,6 +244,7 @@ native_register(DNSServiceRef *reference, DNSServiceFlags flags, uint32_t interf
 
     if (!error) {
         service->status = DNS_REQUEST_PENDING;
+        service->outstanding = 1;
         service->request.Version = DNS_QUERY_REQUEST_VERSION1;
         service->request.InterfaceIndex = interface_index;
         service->request.pServiceInstance = service->instance;
@@ -219,6 +253,7 @@ native_register(DNSServiceRef *reference, DNSServiceFlags flags, uint32_t interf
         service->request.unicastEnabled = FALSE;
         const DWORD result = service_register(&service->request, NULL);
         if (result != DNS_REQUEST_PENDING) {
+            service->outstanding = 0;  /* no callback comes */
             error = result == ERROR_SERVICE_NOT_ACTIVE ? kDNSServiceErr_ServiceNotRunning
                                                        : kDNSServiceErr_Unknown;
         }
@@ -234,14 +269,18 @@ native_register(DNSServiceRef *reference, DNSServiceFlags flags, uint32_t interf
 static void DNSSD_API
 native_deallocate(DNSServiceRef service) {
     if (!service) return;
-    ResetEvent(service->completed);
+    /* Counted before the call: its callback may run before it returns. */
+    InterlockedIncrement(&service->outstanding);
     const DWORD result = service_deregister(&service->request, NULL);
-    /* The completion callback still refers to the service: free it only
-       once deregistration has completed, else leave it (a few hundred
-       bytes) rather than risk a late callback into freed memory. */
-    if (result == DNS_REQUEST_PENDING &&
-        WaitForSingleObject(service->completed, DEREGISTER_WAIT_MS) != WAIT_OBJECT_0) {
-        return;
+    if (result != DNS_REQUEST_PENDING) InterlockedDecrement(&service->outstanding);
+    /* Callbacks (this deregistration's, and a registration's still in
+       progress) refer to the service: free it only once none is left to
+       come, else leave it (a few hundred bytes) rather than risk a late
+       callback into freed memory. */
+    for (DWORD waited = 0; InterlockedCompareExchange(&service->outstanding, 0, 0) > 0;
+         waited += DEREGISTER_POLL_MS) {
+        if (waited >= DEREGISTER_WAIT_MS) return;
+        Sleep(DEREGISTER_POLL_MS);
     }
     service_free(service);
 }

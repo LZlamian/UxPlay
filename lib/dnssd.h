@@ -54,6 +54,14 @@ DNSSD_API void dnssd_set_pk(dnssd_t *dnssd, char * pk_str);
 /* Which DNS-SD implementation registers the services (for logs). */
 DNSSD_API const char *dnssd_get_backend(dnssd_t *dnssd);
 
+/* The Windows DNS service completes registrations later: 0 once the
+   registered services are announced, DNSSD_REGISTRATION_PENDING until then,
+   or the Windows error code of one that failed (a name conflict, mDNS
+   turned off). Other backends report failures from dnssd_register_* and
+   always return 0. */
+#define DNSSD_REGISTRATION_PENDING (-1)
+DNSSD_API int dnssd_get_registration_status(dnssd_t *dnssd);
+
 DNSSD_API void dnssd_destroy(dnssd_t *dnssd);
 
 #ifdef __cplusplus

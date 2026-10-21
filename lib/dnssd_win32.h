@@ -30,6 +30,10 @@ typedef struct {
 /* Fills `functions` when the Windows DNS service API exists (dnsapi.dll on
    Windows 10 1809+); false otherwise. */
 bool dnssd_win32_native(dnssd_win32_functions_t *functions);
+
+/* A service registered through those functions: -1 until its registration
+   completed, then the completion status (0 when it succeeded). */
+long dnssd_win32_registration_status(DNSServiceRef service);
 #endif
 
 #endif

@@ -122,6 +122,34 @@ typedef uint16_t (DNSSD_STDCALL *TXTRecordGetLength_t)(const TXTRecordRef *txtRe
 typedef const void * (DNSSD_STDCALL *TXTRecordGetBytesPtr_t)(const TXTRecordRef *txtRecord);
 
 
+#ifdef WIN32
+typedef DNSServiceErrorType (DNSSD_STDCALL *DNSServiceGetProperty_t)(const char *property,
+                                                                      void *result,
+                                                                      uint32_t *size);
+
+/* Bonjour's dnssd.dll from System32, not the application's folder, and only
+   while the Bonjour service runs: with it stopped every registration fails,
+   so the Windows DNS service is used instead (obs-airplay).
+   UXPLAY_DNSSD_DLL names another file (tests). */
+static HMODULE
+load_bonjour(void) {
+    const char *path = getenv("UXPLAY_DNSSD_DLL");
+    HMODULE module = path && *path
+        ? LoadLibraryA(path)
+        : LoadLibraryExA("dnssd.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) return NULL;
+    DNSServiceGetProperty_t get_property =
+        (DNSServiceGetProperty_t) (void *) GetProcAddress(module, "DNSServiceGetProperty");
+    uint32_t version = 0;
+    uint32_t size = sizeof(version);
+    if (!get_property || get_property("DaemonVersion", &version, &size) != kDNSServiceErr_NoError) {
+        FreeLibrary(module);
+        return NULL;
+    }
+    return module;
+}
+#endif
+
 struct dnssd_s {
 #ifdef WIN32
     HMODULE module;            /* Bonjour's dnssd.dll, or NULL: Windows DNS service */
@@ -204,7 +232,7 @@ dnssd_init(const char* name, int name_len, const char* hw_addr, int hw_addr_len,
     const char *backend = getenv("UXPLAY_DNSSD_BACKEND");
     const bool bonjour_allowed = !backend || strcmp(backend, "windows") != 0;
     const bool native_allowed = !backend || strcmp(backend, "bonjour") != 0;
-    dnssd->module = bonjour_allowed ? LoadLibraryA("dnssd.dll") : NULL;
+    dnssd->module = bonjour_allowed ? load_bonjour() : NULL;
 	if (!dnssd->module) {
 		dnssd_win32_functions_t native;
 		if (!native_allowed || !dnssd_win32_native(&native)) {
@@ -568,6 +596,22 @@ void dnssd_set_airplay_features(dnssd_t *dnssd, int bit, int val) {
     } else {
         *features = *features & ~mask;
     }
+}
+
+int
+dnssd_get_registration_status(dnssd_t *dnssd) {
+#ifdef WIN32
+    if (dnssd && !dnssd->module) {
+        const long raop = dnssd_win32_registration_status(dnssd->raop_service);
+        const long airplay = dnssd_win32_registration_status(dnssd->airplay_service);
+        if (raop > 0) return (int) raop;
+        if (airplay > 0) return (int) airplay;
+        if (raop < 0 || airplay < 0) return DNSSD_REGISTRATION_PENDING;
+    }
+#else
+    (void) dnssd;
+#endif
+    return 0;
 }
 
 const char *
