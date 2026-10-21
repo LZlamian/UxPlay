@@ -647,11 +647,16 @@ void destroy_media_data_store(airplay_video_t *airplay_video) {
         }
     }
     free (media_data_store);
+    airplay_video->media_data_store = NULL;
     airplay_video->num_uri = 0;
 }
 
 void create_media_data_store(airplay_video_t * airplay_video, char ** uri_list, int num_uri) {  
     destroy_media_data_store(airplay_video);
+    if (num_uri <= 0) {
+        /* no media URIs under the item's prefix: nothing to store */
+        return;
+    }
     media_item_t *media_data_store = calloc(num_uri, sizeof(media_item_t));
     if (!media_data_store) {
         printf("Memory allocation failure (media_data_store)\n");
