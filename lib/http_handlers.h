@@ -715,11 +715,9 @@ http_handler_set_property(raop_conn_t *conn,
                     plist_get_string_val(req_value_options_name_node, &name);
                     if (name) {
                         language_name = (char *) calloc(strlen(name) + 1, sizeof(char));
-                        if (!language_name) {
-                            printf("Memory allocation failed\n");
-                            exit(1);
+                        if (language_name) {
+                            memcpy(language_name, name, strlen(name));
                         }
-                        memcpy(language_name, name, strlen(name));
                         plist_mem_free(name);
                     }
                 }
@@ -730,11 +728,9 @@ http_handler_set_property(raop_conn_t *conn,
                     plist_get_string_val(req_value_options_code_node, &code);
                     if (code) {
                         language_code = (char *) calloc(strlen(code) + 1, sizeof(char));
-                        if (!language_code) {
-                            printf("Memory allocation failed\n");
-                            exit(1);
+                        if (language_code) {
+                            memcpy(language_code, code, strlen(code));
                         }
-                        memcpy(language_code, code, strlen(code));
                         plist_mem_free(code);
                     }
                 }
@@ -1722,15 +1718,6 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         goto play_error;
     }
 
-#if 0
-    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
-        printf("old: airplay_video[%d] %p %s %f\n", i, raop->airplay_video[i],
-	       get_playback_uuid(raop->airplay_video[i]),
-	       get_duration(raop->airplay_video[i]));
-    }
-    printf("\n");
-    printf("new playback_uuid %s\n\n", playback_uuid);
-#endif
 
     id = get_playlist_by_uuid(raop, playback_uuid);
 
@@ -1827,13 +1814,6 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         airplay_video_destroy(raop->airplay_video[next]);
         raop->airplay_video[next] = NULL;
     }
-#if 0    
-    for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
-        printf("new: airplay_video[%d] %p %s %f\n", i, raop->airplay_video[i],
-	       get_playback_uuid(raop->airplay_video[i]),
-	       get_duration(raop->airplay_video[i]));
-    }
-#endif
 	   
     plist_t req_content_location_node = plist_dict_get_item(req_root_node, "Content-Location");
     if (!req_content_location_node) {
@@ -1963,8 +1943,7 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         size_t len = strlen(get_uri_local_prefix(airplay_video)) + strlen(uri_suffix);
         char *location = (char *) calloc(len + 1, sizeof(char));
         if (!location) {
-            printf("Memory allocation failed (location)\n");
-            exit(1);
+            goto play_error;
         }
         strcat(location, get_uri_local_prefix(airplay_video));
         strcat(location, uri_suffix);
@@ -1972,8 +1951,7 @@ http_play_item(raop_conn_t *conn, http_response_t *response, const char *apple_s
         free(location);
         char *uri_prefix = (char *) calloc(strlen(playback_location) + 1, sizeof(char));
         if (!uri_prefix) {
-            printf("Memory allocation failed (uri_prefix)\n");
-            exit(1);
+            goto play_error;
         }
         strcat(uri_prefix, playback_location);
         char *end = strstr(uri_prefix, "/master.m3u8");
@@ -2209,14 +2187,12 @@ http_handler_hls(raop_conn_t *conn,  http_request_t *request, http_response_t *r
         if (master_playlist) {
             size_t len = strlen(master_playlist);
             char * data = (char *) malloc(len + 1);
-            if (!data) {
-                printf("Memory allocation failed (data)\n");
-                exit(1);
+            if (data) {
+                memcpy(data, master_playlist, len);
+                data[len] = '\0';
+                *response_data = data;
+                *response_datalen = (int ) len;
             }
-            memcpy(data, master_playlist, len);
-            data[len] = '\0';
-            *response_data = data;
-            *response_datalen = (int ) len;
         } else {
             logger_log(raop->logger, LOGGER_ERR,"requested master playlist %s not found", url); 
         }
