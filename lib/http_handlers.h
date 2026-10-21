@@ -19,6 +19,7 @@
 #include "airplay_video.h"
 #include "fcup_request.h"
 #include "media_url_policy.h"
+#include "spool.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -29,13 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define MAX_FCUP_MEDIA_BYTES (128U * 1024U * 1024U)
 #define MAX_FCUP_ACTION_BYTES (MAX_FCUP_MEDIA_BYTES + 1024U * 1024U)
-#define MAX_SPOOL_DIRECTORY_BYTES 768U
-/* all spooled items together, on disk */
-#define MAX_SPOOL_TOTAL_BYTES (512ULL * 1024ULL * 1024ULL)
-#define SPOOL_PATH_BYTES 1024U
-#define SPOOL_WRITE_CHUNK_BYTES (1024U * 1024U)
 
 static void
 *hls_get_current_video(raop_t *raop) {
@@ -65,134 +60,16 @@ is_iso_bmff_media(const char *data, size_t size) {
     return data && size >= 12 && !memcmp(data + 4, "ftyp", 4);
 }
 
-static void
-log_spool_failure(logger_t *logger, const char *stage, int error_number) {
-    if (!error_number) error_number = EIO;
-    logger_log(logger, LOGGER_ERR,
-               "[MEDIA] blob spool failed stage=%s errno=%d (%s)",
-               stage, error_number, strerror(error_number));
-}
-
-static bool
-safe_spool_directory(const char *directory) {
-    if (!directory || directory[0] != '/') return false;
-    const size_t length = strnlen(directory, MAX_SPOOL_DIRECTORY_BYTES + 1U);
-    if (!length || length > MAX_SPOOL_DIRECTORY_BYTES) return false;
-    for (size_t i = 0; i < length; ++i) {
-        const unsigned char c = (unsigned char) directory[i];
-        if (c < 0x20 || c == 0x7f) return false;
-    }
-    const char *component = directory;
-    while (*component) {
-        while (*component == '/') ++component;
-        const char *end = component;
-        while (*end && *end != '/') ++end;
-        const size_t component_length = (size_t) (end - component);
-        if ((component_length == 1 && component[0] == '.') ||
-            (component_length == 2 && component[0] == '.' && component[1] == '.')) {
-            return false;
-        }
-        component = end;
-    }
-    struct stat info;
-    return stat(directory, &info) == 0 && S_ISDIR(info.st_mode) &&
-        access(directory, W_OK | X_OK) == 0;
-}
-
-static bool
-same_spool_directory(const char *first, const char *second) {
-    if (!first || !second) return false;
-    size_t first_length = strlen(first);
-    size_t second_length = strlen(second);
-    while (first_length > 1 && first[first_length - 1] == '/') --first_length;
-    while (second_length > 1 && second[second_length - 1] == '/') --second_length;
-    return first_length == second_length &&
-        !strncmp(first, second, first_length);
-}
-
-#define SPOOL_FILE_PREFIX "obs-airplay-fcup-"
-
-/* The directories a spool file may be created in, in order of preference.
-   user_directory must hold MAX_SPOOL_DIRECTORY_BYTES + 1 bytes. */
-static size_t
-spool_directory_candidates(char *user_directory, const char *candidates[3]) {
-    size_t candidate_count = 0;
-    user_directory[0] = '\0';
-#ifdef _CS_DARWIN_USER_TEMP_DIR
-    const size_t needed = confstr(_CS_DARWIN_USER_TEMP_DIR, NULL, 0);
-    if (needed > 1 && needed <= MAX_SPOOL_DIRECTORY_BYTES + 1U &&
-        confstr(_CS_DARWIN_USER_TEMP_DIR, user_directory,
-                MAX_SPOOL_DIRECTORY_BYTES + 1U) == needed &&
-        safe_spool_directory(user_directory)) {
-        candidates[candidate_count++] = user_directory;
-    }
-#endif
-    const char *environment_directory = getenv("TMPDIR");
-    if (safe_spool_directory(environment_directory) &&
-        (candidate_count == 0 ||
-         !same_spool_directory(candidates[0], environment_directory))) {
-        candidates[candidate_count++] = environment_directory;
-    }
-    if (candidate_count == 0 ||
-        !same_spool_directory(candidates[candidate_count - 1], "/private/tmp")) {
-        candidates[candidate_count++] = "/private/tmp";
-    }
-    return candidate_count;
-}
-
-/* Spool files are removed with their playlist item, but not when the host
-   application crashes. Called once at start-up: removes this user's spool
-   files that are more than a day old (younger ones may belong to another
-   running receiver of the same user). */
-static void
-sweep_stale_spool_files(raop_t *raop) {
-    char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
-    const char *candidates[3] = {NULL, NULL, NULL};
-    const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
-    const time_t now = time(NULL);
-    const time_t stale_seconds = 24 * 60 * 60;
-    int removed = 0;
-
-    for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
-        const char *directory = candidates[candidate];
-        if (!safe_spool_directory(directory)) continue;
-        DIR *listing = opendir(directory);
-        if (!listing) continue;
-        struct dirent *entry;
-        while ((entry = readdir(listing)) != NULL) {
-            if (strncmp(entry->d_name, SPOOL_FILE_PREFIX, strlen(SPOOL_FILE_PREFIX))) continue;
-            char path[SPOOL_PATH_BYTES];
-            const int path_length = snprintf(path, sizeof(path), "%s%s%s", directory,
-                                             directory[strlen(directory) - 1] == '/' ? "" : "/",
-                                             entry->d_name);
-            if (path_length <= 0 || (size_t) path_length >= sizeof(path)) continue;
-            struct stat info;
-            if (lstat(path, &info) != 0 || !S_ISREG(info.st_mode) ||
-                info.st_uid != getuid() || now - info.st_mtime < stale_seconds) {
-                continue;
-            }
-            if (unlink(path) == 0) ++removed;
-        }
-        closedir(listing);
-    }
-    if (removed) {
-        logger_log(raop->logger, LOGGER_INFO,
-                   "[MEDIA] removed %d stale media spool file(s)", removed);
-    }
-}
-
 /* httpd thread: room in the spool budget for `size` more bytes, counting the
    files of every item and the replies still being written (obs-airplay) */
 static bool
 spool_budget_allows(raop_t *raop, size_t size) {
     logger_t *logger = raop->logger;
     if (!size || size > MAX_FCUP_MEDIA_BYTES) {
-        log_spool_failure(logger, "validate", EINVAL);
+        logger_log(logger, LOGGER_ERR, "[MEDIA] blob spool failed stage=validate errno=%d (%s)", EINVAL, strerror(EINVAL));
         return false;
     }
-    MUTEX_LOCK(raop->spool_mutex);
-    unsigned long long spooled = raop->spool_pending_bytes;
-    MUTEX_UNLOCK(raop->spool_mutex);
+    unsigned long long spooled = spool_pending_bytes(raop->spool);
     for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
         const char *existing = raop->airplay_video[i]
             ? get_spooled_media_path(raop->airplay_video[i]) : NULL;
@@ -206,226 +83,17 @@ spool_budget_allows(raop_t *raop, size_t size) {
                    "[MEDIA] spooling %zu more bytes would exceed the %llu MiB spool budget "
                    "(%llu MiB in use)", size, MAX_SPOOL_TOTAL_BYTES / (1024ULL * 1024ULL),
                    spooled / (1024ULL * 1024ULL));
-        log_spool_failure(logger, "budget", ENOSPC);
+        logger_log(logger, LOGGER_ERR, "[MEDIA] blob spool failed stage=budget errno=%d (%s)", ENOSPC, strerror(ENOSPC));
         return false;
     }
     return true;
-}
-
-/* Writes reverse-fetched media to a new private spool file and returns its
-   path (caller frees), or NULL. Touches no receiver state, so it runs on the
-   spool worker thread, never on the httpd thread (obs-airplay).
-   delay_ms (tests only) makes the write as slow as a slow disk. */
-static char *
-spool_write_media(logger_t *logger, const char *data, size_t size, int delay_ms) {
-    if (delay_ms > 0) {
-        sleepms(delay_ms);
-    }
-    if (!data || !size || size > MAX_FCUP_MEDIA_BYTES) {
-        log_spool_failure(logger, "validate", EINVAL);
-        return NULL;
-    }
-    char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
-    const char *candidates[3] = {NULL, NULL, NULL};
-    const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
-
-    for (size_t candidate = 0; candidate < candidate_count; ++candidate) {
-        const char *directory = candidates[candidate];
-        if (!safe_spool_directory(directory)) continue;
-
-        char path[SPOOL_PATH_BYTES];
-        const int path_length = snprintf(path, sizeof(path), "%s%s" SPOOL_FILE_PREFIX "XXXXXX",
-                                         directory,
-                                         directory[strlen(directory) - 1] == '/' ? "" : "/");
-        if (path_length <= 0 || (size_t) path_length >= sizeof(path)) {
-            log_spool_failure(logger, "path", ENAMETOOLONG);
-            continue;
-        }
-
-        errno = 0;
-        int fd = mkstemp(path);
-        if (fd < 0) {
-            log_spool_failure(logger, "mkstemp", errno);
-            continue;
-        }
-        logger_log(logger, LOGGER_INFO,
-                   "[MEDIA] blob spool using validated temp directory %s",
-                   directory);
-
-        bool failed = false;
-        if (fchmod(fd, S_IRUSR | S_IWUSR) < 0) {
-            log_spool_failure(logger, "fchmod", errno);
-            failed = true;
-        }
-        if (!failed) {
-            const int descriptor_flags = fcntl(fd, F_GETFD);
-            if (descriptor_flags < 0 ||
-                fcntl(fd, F_SETFD, descriptor_flags | FD_CLOEXEC) < 0) {
-                log_spool_failure(logger, "fcntl", errno);
-                failed = true;
-            }
-        }
-
-        size_t written = 0;
-        while (!failed && written < size) {
-            const size_t remaining = size - written;
-            const size_t chunk = remaining < SPOOL_WRITE_CHUNK_BYTES
-                ? remaining : SPOOL_WRITE_CHUNK_BYTES;
-            const ssize_t result = write(fd, data + written, chunk);
-            if (result < 0 && errno == EINTR) continue;
-            if (result <= 0) {
-                log_spool_failure(logger, "write", result < 0 ? errno : EIO);
-                failed = true;
-                break;
-            }
-            written += (size_t) result;
-        }
-
-        if (close(fd) < 0) {
-            log_spool_failure(logger, "close", errno);
-            failed = true;
-        }
-        if (failed) {
-            unlink(path);
-            continue;
-        }
-
-        errno = 0;
-        char *copy = strdup(path);
-        if (!copy) {
-            log_spool_failure(logger, "strdup", errno ? errno : ENOMEM);
-            unlink(path);
-            continue;
-        }
-        return copy;
-    }
-
-    return NULL;
-}
-
-/* A reverse-fetched media reply waiting to be written, being written, or
-   written and waiting to be applied on the httpd thread (obs-airplay). */
-struct spool_job_s {
-    struct spool_job_s *next;
-    airplay_video_t *video;  /* compared, never dereferenced, off the httpd thread */
-    int video_id;
-    char *url;               /* the item's reverse-fetch URL */
-    plist_t owner;           /* keeps `data` alive (libplist >= 2.1) */
-    char *owned;             /* or a copy of it (older libplist) */
-    const char *data;
-    size_t size;
-    char *path;              /* the spool file, once written; NULL if writing failed */
-    double write_ms;
-};
-
-static void
-spool_job_release_data(spool_job_t *job) {
-    if (job->owner) plist_free(job->owner);
-    if (job->owned) plist_mem_free(job->owned);
-    job->owner = NULL;
-    job->owned = NULL;
-    job->data = NULL;
-}
-
-static void
-spool_job_free(spool_job_t *job) {
-    if (!job) return;
-    spool_job_release_data(job);
-    free(job->url);
-    free(job->path);
-    free(job);
-}
-
-static THREAD_RETVAL
-spool_worker_thread(void *arg) {
-    raop_t *raop = (raop_t *) arg;
-    MUTEX_LOCK(raop->spool_mutex);
-    while (!raop->spool_quit) {
-        spool_job_t *job = raop->spool_queue;
-        if (!job) {
-            pthread_cond_wait(&raop->spool_cond, &raop->spool_mutex);
-            continue;
-        }
-        raop->spool_queue = job->next;
-        job->next = NULL;
-        raop->spool_writing_video = job->video;
-        const int delay_ms = raop->spool_delay_for_testing_ms;
-        MUTEX_UNLOCK(raop->spool_mutex);
-
-        struct timespec started, finished;
-        clock_gettime(CLOCK_MONOTONIC, &started);
-        job->path = spool_write_media(raop->logger, job->data, job->size, delay_ms);
-        clock_gettime(CLOCK_MONOTONIC, &finished);
-        job->write_ms = (double) (finished.tv_sec - started.tv_sec) * 1000.0 +
-                        (double) (finished.tv_nsec - started.tv_nsec) / 1e6;
-        spool_job_release_data(job);
-
-        MUTEX_LOCK(raop->spool_mutex);
-        raop->spool_writing_video = NULL;
-        spool_job_t **tail = &raop->spool_done;
-        while (*tail) tail = &(*tail)->next;
-        *tail = job;
-        MUTEX_UNLOCK(raop->spool_mutex);
-        httpd_wake(raop->httpd);
-        MUTEX_LOCK(raop->spool_mutex);
-    }
-    MUTEX_UNLOCK(raop->spool_mutex);
-    return 0;
-}
-
-/* httpd thread: hands a reply to the spool worker, starting it on first use.
-   Takes the job; false (job freed) if the worker cannot be started. */
-static bool
-spool_enqueue(raop_t *raop, spool_job_t *job) {
-    MUTEX_LOCK(raop->spool_mutex);
-    if (raop->spool_quit) {
-        /* raop_destroy has shut the worker down (a request still being
-           served): a new one would never be joined */
-        MUTEX_UNLOCK(raop->spool_mutex);
-        spool_job_free(job);
-        return false;
-    }
-    if (!raop->spool_thread_running) {
-        if (pthread_create(&raop->spool_thread, NULL, spool_worker_thread, raop) != 0) {
-            MUTEX_UNLOCK(raop->spool_mutex);
-            log_spool_failure(raop->logger, "thread", errno ? errno : EAGAIN);
-            spool_job_free(job);
-            return false;
-        }
-        raop->spool_thread_running = true;
-    }
-    spool_job_t **tail = &raop->spool_queue;
-    while (*tail) tail = &(*tail)->next;
-    *tail = job;
-    raop->spool_pending_bytes += job->size;
-    pthread_cond_signal(&raop->spool_cond);
-    MUTEX_UNLOCK(raop->spool_mutex);
-    return true;
-}
-
-/* httpd thread: a reply for this item is already queued or being written */
-static bool
-spool_job_pending_for(raop_t *raop, airplay_video_t *video) {
-    bool pending = false;
-    MUTEX_LOCK(raop->spool_mutex);
-    for (spool_job_t *job = raop->spool_queue; job && !pending; job = job->next) {
-        pending = job->video == video;
-    }
-    for (spool_job_t *job = raop->spool_done; job && !pending; job = job->next) {
-        pending = job->video == video;
-    }
-    if (!pending && raop->spool_writing_video == video && video) pending = true;
-    MUTEX_UNLOCK(raop->spool_mutex);
-    return pending;
 }
 
 /* httpd thread: start playing a written spool file, if its item is still
    the current one waiting for it; otherwise remove the file */
 static void
 spool_apply(raop_t *raop, spool_job_t *job) {
-    MUTEX_LOCK(raop->spool_mutex);
-    raop->spool_pending_bytes -= job->size;
-    MUTEX_UNLOCK(raop->spool_mutex);
+    spool_job_applied(raop->spool, job);
 
     airplay_video_t *video = (job->video_id >= 0 && job->video_id < MAX_AIRPLAY_VIDEO)
         ? raop->airplay_video[job->video_id] : NULL;
@@ -463,43 +131,12 @@ spool_apply(raop_t *raop, spool_job_t *job) {
 static void
 spool_thread_tick(void *opaque) {
     raop_t *raop = (raop_t *) opaque;
-    MUTEX_LOCK(raop->spool_mutex);
-    spool_job_t *done = raop->spool_done;
-    raop->spool_done = NULL;
-    MUTEX_UNLOCK(raop->spool_mutex);
+    spool_job_t *done = spool_take_done(raop->spool);
     while (done) {
         spool_job_t *next = done->next;
         spool_apply(raop, done);
         spool_job_free(done);
         done = next;
-    }
-}
-
-/* Stops the worker (waiting for a file being written) and discards every
-   job, removing files that were written but not applied. */
-static void
-spool_shutdown(raop_t *raop) {
-    MUTEX_LOCK(raop->spool_mutex);
-    const bool running = raop->spool_thread_running;
-    raop->spool_quit = true;
-    pthread_cond_signal(&raop->spool_cond);
-    MUTEX_UNLOCK(raop->spool_mutex);
-    if (running) {
-        THREAD_JOIN(raop->spool_thread);
-    }
-    MUTEX_LOCK(raop->spool_mutex);
-    raop->spool_thread_running = false;
-    spool_job_t *lists[2] = {raop->spool_queue, raop->spool_done};
-    raop->spool_queue = raop->spool_done = NULL;
-    raop->spool_pending_bytes = 0;
-    MUTEX_UNLOCK(raop->spool_mutex);
-    for (int i = 0; i < 2; i++) {
-        for (spool_job_t *job = lists[i]; job;) {
-            spool_job_t *next = job->next;
-            if (job->path) unlink(job->path);
-            spool_job_free(job);
-            job = next;
-        }
     }
 }
 
@@ -1048,6 +685,298 @@ http_send_pending_reverse_media(raop_conn_t *conn) {
 static void http_play_item(raop_conn_t *conn, http_response_t *response,
                            const char *apple_session_id, plist_t req_root_node);
 
+/* POST /action playlistRemove: the sender removed its current item; the
+   last frame is held (obs-airplay). False for a malformed request. */
+static bool
+action_playlist_remove(raop_t *raop, airplay_video_t *airplay_video, plist_t req_params_node) {
+    plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
+    if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
+        return false;
+    }
+    plist_t req_params_item_uuid_node = plist_dict_get_item(req_params_item_node, "uuid");
+    char* remove_uuid = NULL;
+    if (PLIST_IS_STRING(req_params_item_uuid_node)) {
+        plist_get_string_val(req_params_item_uuid_node, &remove_uuid);
+    }
+    if (!remove_uuid) {
+        return false;
+    }
+    int id  =  get_playlist_by_uuid(raop, remove_uuid);
+    if (airplay_video && id == raop->current_video) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] playlistRemove: current item removed (holding last frame)");
+        raop->current_video = -1;
+        float position = raop->callbacks.on_video_playlist_remove(raop->callbacks.cls);
+        /* keep the playlist (until space is needed for another one) in case its playback_uuid is re-requested
+           the video will then be restarted at its previous position */
+        set_resume_position_seconds(airplay_video, position);
+    } else {
+        logger_log(raop->logger, LOGGER_WARNING, "playlistRemove uuid %s does not match current_video\n", remove_uuid);
+    }
+    plist_mem_free (remove_uuid);
+    return true;
+}
+
+/* POST /action playlistInsert: the sender replaced its item; answered like
+   POST /play (obs-airplay). */
+static bool
+action_playlist_insert(raop_conn_t *conn, http_response_t *response, const char *session_id,
+                       plist_t req_params_node) {
+    raop_t *raop = conn->raop;
+    plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
+    if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
+        logger_log(raop->logger, LOGGER_ERR, "[MEDIA] playlistInsert without an item dictionary");
+        return false;
+    }
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] playlistInsert: sender replaced its current item; playing the new item");
+    /* the item has the same keys as a POST /play body */
+    http_play_item(conn, response, session_id, plist_copy(req_params_item_node));
+    return true;
+}
+
+/* The reply to a reverse fetch of sender-local media (a page's blob or
+   file): handed to the spool worker (obs-airplay). `data` belongs to the
+   request plist (*req_root_node, libplist >= 2.1) or to *owned, which the
+   job may take; a job takes either. False when it cannot be used: the
+   item is stopped. */
+static bool
+reverse_media_reply(raop_t *raop, airplay_video_t *airplay_video, plist_t *req_root_node,
+                    const char *fcup_response_url, const char *data, char **owned, int datalen,
+                    int request_id, bool status_present, int statuscode) {
+    const char *requested_url = get_playback_location(airplay_video);
+    const bool url_matches = requested_url && !strcmp(requested_url, fcup_response_url);
+    const int expected_request_id = get_reverse_media_request_id(airplay_video);
+    const bool request_id_matches = request_id <= 0 || expected_request_id <= 0 ||
+        request_id == expected_request_id;
+    if (!request_id_matches) {
+        /* Request IDs are commonly scoped to each playlist. Keep the
+           mismatch visible, but do not reject an otherwise matching
+           sender response. */
+        logger_log(raop->logger, LOGGER_WARNING,
+                   "[MEDIA] reverse-fetch reply request ID differs "
+                   "(reply=%d expected=%d); accepting URL-matched response",
+                   request_id, expected_request_id);
+    }
+    /* Some Apple senders use 0 when no HTTP status applies to a
+       sender-local reverse fetch. */
+    const bool status_ok = !status_present || statuscode == 0 ||
+        (statuscode >= 200 && statuscode < 300);
+    const bool size_ok = datalen > 0 && (uint64_t) datalen <= (uint64_t) MAX_FCUP_MEDIA_BYTES;
+    const bool format_ok = size_ok && is_iso_bmff_media(data, (size_t) datalen);
+
+    /* A sender may repeat its reply; one is enough. */
+    if (spool_job_pending_for(raop->spool, airplay_video)) {
+        logger_log(raop->logger, LOGGER_INFO,
+                   "[MEDIA] reverse-fetch reply already being spooled; ignoring the repeat");
+        return true;
+    }
+
+    /* The file is written by the spool worker (spool.c) so this thread
+       keeps serving requests; spool_apply starts playback here once it is
+       written. */
+    const bool spool_attempted = url_matches && status_ok && format_ok &&
+        spool_budget_allows(raop, (size_t) datalen);
+    bool spool_queued = false;
+    if (spool_attempted) {
+        spool_job_t *job = (spool_job_t *) calloc(1, sizeof(spool_job_t));
+        char *job_url = strdup(fcup_response_url);
+        if (job && job_url) {
+            job->video = airplay_video;
+            job->video_id = raop->current_video;
+            job->url = job_url;
+            job->data = data;
+            job->size = (size_t) datalen;
+            if (*owned) {
+                job->owned = *owned;
+                *owned = NULL;
+            } else {
+                /* the data lives in the request plist: the job keeps it */
+                job->owner = *req_root_node;
+                *req_root_node = NULL;
+            }
+            spool_queued = spool_enqueue(raop->spool, job);
+        } else {
+            free(job_url);
+            free(job);
+        }
+    }
+    if (!spool_queued) {
+        logger_log(raop->logger, LOGGER_ERR,
+                   "[MEDIA] reverse sender-local media fetch unusable "
+                   "(url_match=%d request_id=%d expected=%d request_id_ok=%d "
+                   "status_present=%d status=%d status_ok=%d "
+                   "bytes=%d iso_bmff=%d spool_attempted=%d)",
+                   url_matches, request_id, expected_request_id, request_id_matches,
+                   status_present, statuscode, status_ok, datalen, format_ok, spool_attempted);
+        raop->callbacks.on_video_stop(raop->callbacks.cls);
+        const int failed_id = raop->current_video;
+        if (failed_id >= 0) raop_destroy_airplay_video(raop, failed_id);
+        return false;
+    }
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] reverse-fetched sender-local media received (%d bytes); "
+               "spooling it off the network thread", datalen);
+    return true;
+}
+
+/* The reply to a reverse fetch of an HLS item's master or media playlist:
+   stored, the next playlist requested, or playback started once all are
+   in. False when the item expects no playlist. */
+static bool
+hls_playlist_reply(raop_conn_t *conn, airplay_video_t *airplay_video,
+                   const char *fcup_response_url, const char *data, int datalen,
+                   const char *apple_session_id) {
+    raop_t *raop = conn->raop;
+    /* Only an HLS item (one with a uri prefix from its /play) expects
+       playlists here. A reply for any other item (a direct URL, or one
+       whose reverse fetch is already done) has nothing to attach to. */
+    if (!get_uri_prefix(airplay_video) || !get_uri_local_prefix(airplay_video)) {
+        logger_log(raop->logger, LOGGER_WARNING,
+                   "[MEDIA] ignoring unexpected reverse-fetch reply for a non-HLS item");
+        return false;
+    }
+
+    char *playlist = (char *) malloc(datalen + 1);
+    if (!playlist) {
+        return false;
+    }
+    playlist[datalen] = '\0';
+    memcpy(playlist, data, datalen);
+    int playlist_len = strlen(playlist);
+
+    if (logger_get_level(raop->logger) >= LOGGER_DEBUG) {
+        logger_log(raop->logger, LOGGER_DEBUG, "begin FCUP Response data:\n%s\nend FCUP Response data", playlist);
+    }
+
+    const char *ptr = strstr(fcup_response_url, "/master.m3u8");
+    if (ptr) {
+        /* this is a master playlist */
+        const char *uri_prefix = get_uri_prefix(airplay_video);
+        char ** uri_list = NULL;
+        int num_uri = 0;
+        char *uri_local_prefix = get_uri_local_prefix(airplay_video);
+        playlist = select_master_playlist_language(airplay_video, playlist);
+        playlist_len = strlen(playlist);
+        create_media_uri_table(uri_prefix, playlist, playlist_len, &uri_list, &num_uri);	
+        char *new_master = adjust_master_playlist (playlist, playlist_len,  uri_prefix, uri_local_prefix);
+        free(playlist);
+        store_master_playlist(airplay_video, new_master);
+        create_media_data_store(airplay_video, uri_list, num_uri);
+        free (uri_list);
+        set_next_media_uri_id(airplay_video, 0);
+    } else {
+        /* this is a media playlist */
+        float duration = 0.0f;
+        bool endlist = false;
+        int count = analyze_media_playlist(playlist, &duration, &endlist);
+        int uri_num = get_next_media_uri_id(airplay_video);
+        --uri_num;    // (next num is current num + 1)
+        int ret = store_media_playlist(airplay_video, playlist, &count, &duration, &endlist, uri_num);
+        if (ret < 0) {
+            /* not stored (no such media uri, or it already has a
+               playlist): the buffer is still ours */
+            free(playlist);
+        } else if (ret == 1) {
+            logger_log(raop->logger, LOGGER_DEBUG,"media_playlist is a duplicate: do not store");
+        } else if (count) {
+            logger_log(raop->logger, LOGGER_DEBUG,
+                       "\n%s:\nreceived media playlist has %5d chunks, total duration %9.3f secs\n",
+                        fcup_response_url, count, duration);
+        }
+    }
+
+    int num_uri = get_num_media_uri(airplay_video);
+    int uri_num = get_next_media_uri_id(airplay_video);
+    if (uri_num <  num_uri) {
+        fcup_request((void *) conn, get_media_uri_by_num(airplay_video, uri_num),
+                                                         apple_session_id,
+                                                         get_next_FCUP_RequestID(airplay_video));
+        set_next_media_uri_id(airplay_video, ++uri_num);
+    } else {
+        raop->callbacks.on_video_play(raop->callbacks.cls,
+                                            get_playback_location(airplay_video),
+                                            get_start_position_seconds(airplay_video));
+    }
+    return true;
+}
+
+/* POST /action unhandledURLResponse: the sender's answer to a reverse
+   fetch (FCUP). False for a malformed or unusable reply. */
+static bool
+action_unhandled_url_response(raop_conn_t *conn, airplay_video_t *airplay_video,
+                              plist_t *req_root_node, plist_t req_params_node,
+                              const char *apple_session_id) {
+    raop_t *raop = conn->raop;
+    uint64_t uint_val = 0;
+    int request_id = 0;
+    int fcup_response_statuscode = 0;
+    bool fcup_response_status_present = false;
+
+    plist_t req_params_fcup_response_statuscode_node = plist_dict_get_item(req_params_node,
+                                                              "FCUP_Response_StatusCode");
+    if (req_params_fcup_response_statuscode_node) {
+        plist_get_uint_val(req_params_fcup_response_statuscode_node, &uint_val);
+        fcup_response_statuscode = (int) uint_val;
+        fcup_response_status_present = true;
+        uint_val = 0;
+    }
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] reverse fetch response status_present=%d status=%d",
+               fcup_response_status_present, fcup_response_statuscode);
+
+    plist_t req_params_fcup_response_requestid_node = plist_dict_get_item(req_params_node,
+                                                             "FCUP_Response_RequestID");
+    if (req_params_fcup_response_requestid_node) {
+        plist_get_uint_val(req_params_fcup_response_requestid_node, &uint_val);
+        request_id = (int) uint_val;
+        uint_val = 0;
+        logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_RequestID =  %d", request_id);
+    }
+
+    plist_t req_params_fcup_response_url_node = plist_dict_get_item(req_params_node, "FCUP_Response_URL");
+    if (!PLIST_IS_STRING(req_params_fcup_response_url_node)) {
+        return false;
+    }
+    char *fcup_response_url = NULL;
+    plist_get_string_val(req_params_fcup_response_url_node, &fcup_response_url);
+    if (!fcup_response_url) {
+        return false;
+    }
+
+    plist_t req_params_fcup_response_data_node = plist_dict_get_item(req_params_node, "FCUP_Response_Data");
+    if (!PLIST_IS_DATA(req_params_fcup_response_data_node)){
+        plist_mem_free(fcup_response_url);
+        return false;
+    }
+
+    uint_val = 0;
+    /* `data` is in the request plist (libplist >= 2.1), or the copy `owned` */
+    char *owned = NULL;
+#ifdef PLIST_210
+    const char *data = plist_get_data_ptr(req_params_fcup_response_data_node, &uint_val);
+#else
+    plist_get_data_val(req_params_fcup_response_data_node, &owned, &uint_val);
+    const char *data = owned;
+#endif
+    const int datalen = (int) uint_val;
+    logger_log(raop->logger, LOGGER_INFO,
+               "[MEDIA] received reverse-fetch reply (request_id=%d, bytes=%d)",
+               request_id, datalen);
+    bool handled = false;
+    if (data) {
+        handled = get_reverse_media_pending(airplay_video)
+            ? reverse_media_reply(raop, airplay_video, req_root_node, fcup_response_url, data,
+                                  &owned, datalen, request_id, fcup_response_status_present,
+                                  fcup_response_statuscode)
+            : hls_playlist_reply(conn, airplay_video, fcup_response_url, data, datalen,
+                                 apple_session_id);
+    }
+    if (owned) plist_mem_free(owned);
+    plist_mem_free(fcup_response_url);
+    return handled;
+}
+
 static void
 http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t *response,
                     char **response_data, int *response_datalen) {
@@ -1057,11 +986,6 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
     bool data_is_plist = false;
     plist_t req_root_node = NULL;
-    uint64_t uint_val = 0;
-    int request_id = 0;
-    int fcup_response_statuscode = 0;
-    bool fcup_response_status_present = false;
-    bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
     /* Every error path reaches post_action_error, including paths above plist
        parsing. Keep cleanup-owned locals initialized before the first goto. */
     char *type = NULL;
@@ -1147,286 +1071,19 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
                    "[MEDIA] POST /action %s arrived before a valid POST /play", type);
         goto post_action_error;
     }
-    if (!strcmp(type,"playlistRemove")) {
-        plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
-        if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
-            goto post_action_error;
-        }
-        plist_t req_params_item_uuid_node = plist_dict_get_item(req_params_item_node, "uuid");
-        char* remove_uuid = NULL;
-        if (PLIST_IS_STRING(req_params_item_uuid_node)) {
-            plist_get_string_val(req_params_item_uuid_node, &remove_uuid);
-        }
-        if (!remove_uuid) {
-            goto post_action_error;
-        }
-        int id  =  get_playlist_by_uuid(raop, remove_uuid);
-        if (airplay_video && id == raop->current_video) {
-            logger_log(raop->logger, LOGGER_INFO,
-                       "[MEDIA] playlistRemove: current item removed (holding last frame)");
-            raop->current_video = -1;
-            float position = raop->callbacks.on_video_playlist_remove(raop->callbacks.cls);
-            /* keep the playlist (until space is needed for another one) in case its playback_uuid is re-requested
-               the video will then be restarted at its previous position */
-            set_resume_position_seconds(airplay_video, position);
-        } else {
-            logger_log(raop->logger, LOGGER_WARNING, "playlistRemove uuid %s does not match current_video\n", remove_uuid);
-        }
-        plist_mem_free (remove_uuid);
-
+    bool handled = true;
+    if (!strcmp(type, "playlistRemove")) {
+        handled = action_playlist_remove(raop, airplay_video, req_params_node);
     } else if (!strcmp(type, "playlistInsert")) {
-        plist_t req_params_item_node = plist_dict_get_item(req_params_node, "item");
-        if (!req_params_item_node || !PLIST_IS_DICT (req_params_item_node)) {
-            logger_log(raop->logger, LOGGER_ERR, "[MEDIA] playlistInsert without an item dictionary");
-            goto post_action_error;
-        }
-        logger_log(raop->logger, LOGGER_INFO,
-                   "[MEDIA] playlistInsert: sender replaced its current item; playing the new item");
-        /* the item has the same keys as a POST /play body */
-        http_play_item(conn, response, session_id, plist_copy(req_params_item_node));
-        goto post_action_success;
-
-    } else if (!strcmp(type, "unhandledURLResponse")) {   
-        /* handling type "unhandledURLResponse" */
-        uint_val = 0;
-        int fcup_response_datalen = 0;
-
-        plist_t req_params_fcup_response_statuscode_node = plist_dict_get_item(req_params_node,
-                                                                  "FCUP_Response_StatusCode");
-        if (req_params_fcup_response_statuscode_node) {
-            plist_get_uint_val(req_params_fcup_response_statuscode_node, &uint_val);
-            fcup_response_statuscode = (int) uint_val;
-            fcup_response_status_present = true;
-            uint_val = 0;
-        }
-        logger_log(raop->logger, LOGGER_INFO,
-                   "[MEDIA] reverse fetch response status_present=%d status=%d",
-                   fcup_response_status_present, fcup_response_statuscode);
-
-        plist_t req_params_fcup_response_requestid_node = plist_dict_get_item(req_params_node,
-                                                                 "FCUP_Response_RequestID");
-        if (req_params_fcup_response_requestid_node) {
-            plist_get_uint_val(req_params_fcup_response_requestid_node, &uint_val);
-            request_id = (int) uint_val;
-            uint_val = 0;
-            logger_log(raop->logger, LOGGER_DEBUG, "FCUP_Response_RequestID =  %d", request_id);
-        }
-
-        plist_t req_params_fcup_response_url_node = plist_dict_get_item(req_params_node, "FCUP_Response_URL");
-        if (!PLIST_IS_STRING(req_params_fcup_response_url_node)) {
-            goto post_action_error;
-        }
-        char *fcup_response_url = NULL;
-        plist_get_string_val(req_params_fcup_response_url_node, &fcup_response_url);
-        if (!fcup_response_url) {
-            goto post_action_error;
-        }
-
-        plist_t req_params_fcup_response_data_node = plist_dict_get_item(req_params_node, "FCUP_Response_Data");
-        if (!PLIST_IS_DATA(req_params_fcup_response_data_node)){
-            plist_mem_free(fcup_response_url);
-            goto post_action_error;
-        }
-
-        uint_val = 0;
-#ifdef PLIST_210
-        const char *fcup_response_data = NULL;
-        fcup_response_data = plist_get_data_ptr(req_params_fcup_response_data_node, &uint_val);
-#else
-        char *fcup_response_data = NULL;
-        plist_get_data_val(req_params_fcup_response_data_node, &fcup_response_data, &uint_val);
-#endif
-        fcup_response_datalen = (int) uint_val;
-        logger_log(raop->logger, LOGGER_INFO,
-                   "[MEDIA] received reverse-fetch reply (request_id=%d, bytes=%d)",
-                   request_id, fcup_response_datalen);
-        if (!fcup_response_data) {
-            plist_mem_free(fcup_response_url);
-            goto post_action_error;
-        }
-
-        if (get_reverse_media_pending(airplay_video)) {
-            const char *requested_url = get_playback_location(airplay_video);
-            const bool url_matches = requested_url &&
-                !strcmp(requested_url, fcup_response_url);
-            const int expected_request_id = get_reverse_media_request_id(airplay_video);
-            const bool request_id_matches = request_id <= 0 || expected_request_id <= 0 ||
-                request_id == expected_request_id;
-            if (!request_id_matches) {
-                /* Request IDs are commonly scoped to each playlist. Keep the
-                   mismatch visible, but do not reject an otherwise matching
-                   sender response. */
-                logger_log(raop->logger, LOGGER_WARNING,
-                           "[MEDIA] reverse-fetch reply request ID differs "
-                           "(reply=%d expected=%d); accepting URL-matched response",
-                           request_id, expected_request_id);
-            }
-            /* Some Apple senders use 0 when no HTTP status applies to a
-               sender-local reverse fetch. */
-            const bool status_ok = !fcup_response_status_present ||
-                fcup_response_statuscode == 0 ||
-                (fcup_response_statuscode >= 200 && fcup_response_statuscode < 300);
-            const bool size_ok = fcup_response_datalen > 0 &&
-                (uint64_t) fcup_response_datalen <= (uint64_t) MAX_FCUP_MEDIA_BYTES;
-            const bool format_ok = size_ok &&
-                is_iso_bmff_media(fcup_response_data, (size_t) fcup_response_datalen);
-
-            /* A sender may repeat its reply; one is enough. */
-            if (spool_job_pending_for(raop, airplay_video)) {
-                logger_log(raop->logger, LOGGER_INFO,
-                           "[MEDIA] reverse-fetch reply already being spooled; ignoring the repeat");
-#ifndef PLIST_210
-                plist_mem_free(fcup_response_data);
-#endif
-                plist_mem_free(fcup_response_url);
-                goto post_action_success;
-            }
-
-            /* The file is written by the spool worker (spool_write_media) so
-               this thread keeps serving requests; spool_apply starts playback
-               here once it is written (obs-airplay). */
-            const bool spool_attempted = url_matches && status_ok && format_ok &&
-                spool_budget_allows(raop, (size_t) fcup_response_datalen);
-            bool spool_queued = false;
-            if (spool_attempted) {
-                spool_job_t *job = (spool_job_t *) calloc(1, sizeof(spool_job_t));
-                char *job_url = strdup(fcup_response_url);
-                if (job && job_url) {
-                    job->video = airplay_video;
-                    job->video_id = raop->current_video;
-                    job->url = job_url;
-                    job->data = fcup_response_data;
-                    job->size = (size_t) fcup_response_datalen;
-#ifdef PLIST_210
-                    /* the data lives in the request plist: the job keeps it */
-                    job->owner = req_root_node;
-                    req_root_node = NULL;
-#else
-                    job->owned = fcup_response_data;
-                    fcup_response_data = NULL;
-#endif
-                    spool_queued = spool_enqueue(raop, job);
-                } else {
-                    free(job_url);
-                    free(job);
-                }
-            }
-#ifndef PLIST_210
-            if (fcup_response_data) plist_mem_free(fcup_response_data);
-#endif
-
-            if (!spool_queued) {
-                logger_log(raop->logger, LOGGER_ERR,
-                           "[MEDIA] reverse sender-local media fetch unusable "
-                           "(url_match=%d request_id=%d expected=%d request_id_ok=%d "
-                           "status_present=%d status=%d status_ok=%d "
-                           "bytes=%d iso_bmff=%d spool_attempted=%d)",
-                           url_matches, request_id, expected_request_id, request_id_matches,
-                           fcup_response_status_present,
-                           fcup_response_statuscode, status_ok, fcup_response_datalen,
-                           format_ok, spool_attempted);
-                plist_mem_free(fcup_response_url);
-                raop->callbacks.on_video_stop(raop->callbacks.cls);
-                const int failed_id = raop->current_video;
-                if (failed_id >= 0) raop_destroy_airplay_video(raop, failed_id);
-                goto post_action_error;
-            }
-            logger_log(raop->logger, LOGGER_INFO,
-                       "[MEDIA] reverse-fetched sender-local media received (%d bytes); "
-                       "spooling it off the network thread",
-                       fcup_response_datalen);
-            plist_mem_free(fcup_response_url);
-            goto post_action_success;
-        }
-
-        /* Only an HLS item (one with a uri prefix from its /play) expects
-           playlists here. A reply for any other item (a direct URL, or one
-           whose reverse fetch is already done) has nothing to attach to. */
-        if (!get_uri_prefix(airplay_video) || !get_uri_local_prefix(airplay_video)) {
-            logger_log(raop->logger, LOGGER_WARNING,
-                       "[MEDIA] ignoring unexpected reverse-fetch reply for a non-HLS item");
-#ifndef PLIST_210
-            plist_mem_free(fcup_response_data);
-#endif
-            plist_mem_free(fcup_response_url);
-            goto post_action_error;
-        }
-
-        char *playlist = (char *) malloc(fcup_response_datalen + 1);
-        if (!playlist) {
-#ifndef PLIST_210
-            plist_mem_free(fcup_response_data);
-#endif
-            plist_mem_free(fcup_response_url);
-            goto post_action_error;
-        }
-        playlist[fcup_response_datalen] = '\0';
-        memcpy(playlist, fcup_response_data, fcup_response_datalen);
-#ifndef PLIST_210
-        plist_mem_free(fcup_response_data);
-#endif
-        int playlist_len = strlen(playlist);
-    
-        if (logger_debug) {
-            logger_log(raop->logger, LOGGER_DEBUG, "begin FCUP Response data:\n%s\nend FCUP Response data", playlist);
-        }
-
-        char *ptr = strstr(fcup_response_url, "/master.m3u8");
-        if (ptr) {
-            /* this is a master playlist */
-            const char *uri_prefix = get_uri_prefix(airplay_video);
-            char ** uri_list = NULL;
-            int num_uri = 0;
-            char *uri_local_prefix = get_uri_local_prefix(airplay_video);
-            playlist = select_master_playlist_language(airplay_video, playlist);
-            playlist_len = strlen(playlist);
-            create_media_uri_table(uri_prefix, playlist, playlist_len, &uri_list, &num_uri);	
-            char *new_master = adjust_master_playlist (playlist, playlist_len,  uri_prefix, uri_local_prefix);
-            free(playlist);
-            store_master_playlist(airplay_video, new_master);
-            create_media_data_store(airplay_video, uri_list, num_uri);
-            free (uri_list);
-            num_uri =  get_num_media_uri(airplay_video);
-            set_next_media_uri_id(airplay_video, 0);
-        } else {
-            /* this is a media playlist */
-            float duration = 0.0f;
-            bool endlist = false;
-            int count = analyze_media_playlist(playlist, &duration, &endlist);
-            int uri_num = get_next_media_uri_id(airplay_video);
-            --uri_num;    // (next num is current num + 1)
-            int ret = store_media_playlist(airplay_video, playlist, &count, &duration, &endlist, uri_num);
-            if (ret < 0) {
-                /* not stored (no such media uri, or it already has a
-                   playlist): the buffer is still ours */
-                free(playlist);
-            } else if (ret == 1) {
-                logger_log(raop->logger, LOGGER_DEBUG,"media_playlist is a duplicate: do not store");
-            } else if (count) {
-                logger_log(raop->logger, LOGGER_DEBUG,
-                           "\n%s:\nreceived media playlist has %5d chunks, total duration %9.3f secs\n",
-                            fcup_response_url, count, duration);
-            }
-        }
-
-        plist_mem_free(fcup_response_url);
-
-        int num_uri = get_num_media_uri(airplay_video);
-        int uri_num = get_next_media_uri_id(airplay_video);
-        if (uri_num <  num_uri) {
-            fcup_request((void *) conn, get_media_uri_by_num(airplay_video, uri_num),
-                                                             apple_session_id,
-                                                             get_next_FCUP_RequestID(airplay_video));
-            set_next_media_uri_id(airplay_video, ++uri_num);
-        } else {
-            raop->callbacks.on_video_play(raop->callbacks.cls,
-                                                get_playback_location(airplay_video),
-                                                get_start_position_seconds(airplay_video));
-        }
-
-
+        handled = action_playlist_insert(conn, response, session_id, req_params_node);
+    } else if (!strcmp(type, "unhandledURLResponse")) {
+        handled = action_unhandled_url_response(conn, airplay_video, &req_root_node,
+                                                req_params_node, apple_session_id);
     } else {
-        logger_log(raop->logger, LOGGER_INFO, "unknown action type (unhandled)"); 
+        logger_log(raop->logger, LOGGER_INFO, "unknown action type (unhandled)");
+    }
+    if (!handled) {
+        goto post_action_error;
     }
  post_action_success:;
     if (type) plist_mem_free(type);

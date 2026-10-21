@@ -44,25 +44,14 @@ static void plist_mem_free(void *ptr) {
 }
 #endif
 
-typedef struct spool_job_s spool_job_t;
+#include "spool.h"
 
 struct raop_s {
     /* Callbacks for audio and video */
     raop_callbacks_t callbacks;
 
-    /* obs-airplay: reverse-fetched media is written to its spool file by a
-       worker thread, so the httpd thread never waits on the disk; the
-       finished file is applied on the httpd thread (thread_tick). */
-    mutex_handle_t spool_mutex;
-    cond_handle_t spool_cond;
-    thread_handle_t spool_thread;
-    bool spool_thread_running;
-    bool spool_quit;
-    spool_job_t *spool_queue;          /* waiting to be written */
-    spool_job_t *spool_done;           /* written, to be applied */
-    airplay_video_t *spool_writing_video;
-    unsigned long long spool_pending_bytes;
-    int spool_delay_for_testing_ms;
+    /* obs-airplay: writes reverse-fetched media off the httpd thread */
+    spool_t *spool;
 
     /* obs-airplay: the sample rate of the audio format negotiated at SETUP */
     unsigned int audio_sample_rate;
@@ -771,6 +760,13 @@ conn_destroy(void *ptr) {
     free(conn);
 }
 
+/* any thread (the spool worker): run spool_thread_tick on the httpd thread */
+static void
+raop_spool_wake(void *opaque) {
+    raop_t *raop = (raop_t *) opaque;
+    if (raop->httpd) httpd_wake(raop->httpd);
+}
+
 raop_t *
 raop_init(raop_callbacks_t *callbacks) {
     assert(callbacks);
@@ -791,11 +787,14 @@ raop_init(raop_callbacks_t *callbacks) {
     if (!raop) {
         return NULL;
     }
-    MUTEX_CREATE(raop->spool_mutex);
-    COND_CREATE(raop->spool_cond);
-
     /* Initialize the logger */
     raop->logger = logger_init();
+    raop->spool = spool_create(raop->logger, raop_spool_wake, raop);
+    if (!raop->spool) {
+        logger_destroy(raop->logger);
+        free(raop);
+        return NULL;
+    }
 
     /* Copy callbacks structure */
     memcpy(&raop->callbacks, callbacks, sizeof(raop_callbacks_t));
@@ -854,7 +853,7 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
     pairing_t *pairing = NULL;
     httpd_t *httpd = NULL;
 
-    sweep_stale_spool_files(raop);
+    spool_sweep_stale_files(raop->logger);
 
     /* create a new public key for pairing */
     int new_key = 0;
@@ -905,7 +904,8 @@ raop_init2(raop_t *raop, int nohold, const char *device_id, const char *keyfile)
 void
 raop_destroy(raop_t *raop) {
     if (raop) {
-        spool_shutdown(raop);
+        spool_destroy(raop->spool);
+        raop->spool = NULL;
         raop_destroy_airplay_video(raop, -1);
         raop_stop_httpd(raop);
         pairing_destroy(raop->pairing);
@@ -922,8 +922,6 @@ raop_destroy(raop_t *raop) {
             free(raop->lang);
         }
 
-        MUTEX_DESTROY(raop->spool_mutex);
-        COND_DESTROY(raop->spool_cond);
         free(raop);
 
         /* Cleanup the network */
@@ -1001,9 +999,7 @@ raop_test_connection_close(void *connection) {
 
 void
 raop_set_spool_delay_for_testing(raop_t *raop, int milliseconds) {
-    MUTEX_LOCK(raop->spool_mutex);
-    raop->spool_delay_for_testing_ms = milliseconds > 0 ? milliseconds : 0;
-    MUTEX_UNLOCK(raop->spool_mutex);
+    spool_set_delay_for_testing(raop->spool, milliseconds);
 }
 
 void
