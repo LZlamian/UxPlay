@@ -1085,7 +1085,6 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     if (!handled) {
         goto post_action_error;
     }
- post_action_success:;
     if (type) plist_mem_free(type);
     if (req_root_node) plist_free(req_root_node);  /* may have gone to a spool job */
     return;
@@ -1668,16 +1667,10 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
                       char **response_data, int *response_datalen) {
     raop_t *raop = conn->raop;
     char* playback_location = NULL;
-    char* client_proc_name = NULL;
     plist_t req_root_node = NULL;
     float start_position_seconds = 0.0f;
     bool data_is_binary_plist = false;
-    airplay_video_t *airplay_video = NULL;
-    int id = -1;
-    bool created_airplay_video = false;
-    bool playback_stopped = false;
-    bool sender_hosted = false;
-    
+
     logger_log(raop->logger, LOGGER_DEBUG, "http_handler_play");
 
     int request_datalen = -1;
