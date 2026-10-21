@@ -378,8 +378,14 @@ spool_worker_thread(void *arg) {
 static bool
 spool_enqueue(raop_t *raop, spool_job_t *job) {
     MUTEX_LOCK(raop->spool_mutex);
+    if (raop->spool_quit) {
+        /* raop_destroy has shut the worker down (a request still being
+           served): a new one would never be joined */
+        MUTEX_UNLOCK(raop->spool_mutex);
+        spool_job_free(job);
+        return false;
+    }
     if (!raop->spool_thread_running) {
-        raop->spool_quit = false;
         if (pthread_create(&raop->spool_thread, NULL, spool_worker_thread, raop) != 0) {
             MUTEX_UNLOCK(raop->spool_mutex);
             log_spool_failure(raop->logger, "thread", errno ? errno : EAGAIN);
