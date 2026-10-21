@@ -33,6 +33,7 @@
 
 /* drop a connection that stalls mid-request (or never identifies itself)
    for this long; idle keep-alive connections between requests are kept */
+#define HTTPD_DRAIN_SECONDS 2
 #define HTTPD_DEAD_CONNECTION_TIMEOUT 60
 /* accepted sockets are only read after select(); this bounds any recv()
    that would otherwise block the single httpd thread */
@@ -61,6 +62,12 @@ struct http_connection_s {
     char staging[8];
     int staging_len;
     time_t last_active;
+    /* After a 413: the response is sent and the write side shut down; the
+       rest of the body is read and dropped until the peer closes or this
+       time passes. Closing at once with unread data makes TCP send a reset,
+       which on Windows discards the 413 before the peer reads it
+       (obs-airplay). */
+    time_t draining_until;
 };
 typedef struct http_connection_s http_connection_t;
 
@@ -282,6 +289,7 @@ httpd_remove_connection(httpd_t *httpd, http_connection_t *connection, int sock_
     }
     connection->type = CONNECTION_TYPE_UNKNOWN;
     connection->staging_len = 0;
+    connection->draining_until = 0;
 }
 
 static int
@@ -315,6 +323,7 @@ httpd_add_connection(httpd_t *httpd, int fd, unsigned char *local, int local_len
     httpd->connections[i].type = CONNECTION_TYPE_UNKNOWN;   //should not be necessary ...
     httpd->connections[i].staging_len = 0;
     httpd->connections[i].last_active = time(NULL);
+    httpd->connections[i].draining_until = 0;
     return 0;
 }
 
@@ -536,6 +545,12 @@ httpd_thread(void *arg)
             if (!connection->connected) {
                 continue;
             }
+            if (connection->draining_until) {
+                if (now >= connection->draining_until) {
+                    httpd_remove_connection(httpd, connection, 0);
+                }
+                continue;
+            }
             bool stalled = connection->type == CONNECTION_TYPE_UNKNOWN ||
                 (connection->staging_len > 0 && connection->request &&
                  !http_request_is_reverse(connection->request));
@@ -580,6 +595,16 @@ httpd_thread(void *arg)
                 continue;
             }
             if (!FD_ISSET(connection->socket_fd, &rfds)) {
+                continue;
+            }
+
+            if (connection->draining_until) {
+                const int ret = recv(connection->socket_fd, buffer, HTTPD_RECV_BUFFER_BYTES - 1, 0);
+                if (ret == 0 || (ret == -1 && SOCKET_GET_ERROR() != SOCKET_ERRORNAME(EAGAIN) &&
+                                 SOCKET_GET_ERROR() != SOCKET_ERRORNAME(EWOULDBLOCK) &&
+                                 SOCKET_GET_ERROR() != SOCKET_ERRORNAME(EINTR))) {
+                    httpd_remove_connection(httpd, connection, 0);
+                }
                 continue;
             }
 
@@ -707,8 +732,15 @@ httpd_thread(void *arg)
                                "httpd: request body on socket %d exceeds its limit or the shared "
                                "budget (%zu of %zu bytes buffered); answering 413",
                                connection->socket_fd, httpd->body_budget.used, httpd->body_budget.limit);
-                    if (refusal_len > 0) {
-                        send(connection->socket_fd, refusal, (size_t) refusal_len, 0);
+                    if (refusal_len > 0 &&
+                        send(connection->socket_fd, refusal, (size_t) refusal_len, 0) == refusal_len) {
+                        /* drain, then close (draining_until); the request and
+                           its share of the body budget go now */
+                        shutdown(connection->socket_fd, SHUT_WR);
+                        http_request_destroy(connection->request);
+                        connection->request = NULL;
+                        connection->draining_until = time(NULL) + HTTPD_DRAIN_SECONDS;
+                        continue;
                     }
                 } else {
                     char *data = utils_data_to_text((const char *) buffer, recv_datalen > 256 ? 256 : recv_datalen);
