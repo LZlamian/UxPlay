@@ -804,7 +804,7 @@ int create_media_uri_table(const char *url_prefix, const char *master_playlist_d
         if (end == NULL) {
             return 1;
         }
-        end += sizeof("m3u8");
+        end += strlen("m3u8");  /* not sizeof: "m3u8" may end the playlist */
         count++;
         ptr = strstr(end, url_prefix);
     }
@@ -823,8 +823,8 @@ int create_media_uri_table(const char *url_prefix, const char *master_playlist_d
         if (end == NULL) {
             return 0;
         }
-        end += sizeof("m3u8");
-        size_t len = end - ptr - 1;
+        end += strlen("m3u8");
+        size_t len = end - ptr;
 	    uri  = (char *) calloc(len + 1, sizeof(char));
         if (!uri) {
             printf("Memory allocation failure (uri)\n");
