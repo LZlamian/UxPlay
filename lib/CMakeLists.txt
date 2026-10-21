@@ -75,7 +75,9 @@ elseif( WIN32 )
                          wsock32
 			 iphlpapi
                          ws2_32
-                         ntdll )  # RtlIpv4StringToAddressA (media_url.c)
+                         ntdll    # RtlIpv4StringToAddressA (media_url.c)
+                         bcrypt   # spool file names (spool_win32.c)
+                         advapi32 )
   # dnsapi.dll (dnssd_win32.c) is looked up at run time: nothing to link.
 else()
   target_link_libraries( airplay PUBLIC

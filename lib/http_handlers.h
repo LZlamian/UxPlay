@@ -20,6 +20,7 @@
 #include "fcup_request.h"
 #include "media_url_policy.h"
 #include "spool.h"
+#include "spool_file.h"
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -73,9 +74,9 @@ spool_budget_allows(raop_t *raop, size_t size) {
     for (int i = 0; i < MAX_AIRPLAY_VIDEO; i++) {
         const char *existing = raop->airplay_video[i]
             ? get_spooled_media_path(raop->airplay_video[i]) : NULL;
-        struct stat existing_info;
-        if (existing && stat(existing, &existing_info) == 0 && S_ISREG(existing_info.st_mode)) {
-            spooled += (unsigned long long) existing_info.st_size;
+        unsigned long long existing_size = 0;
+        if (existing && spool_file_size(existing, &existing_size)) {
+            spooled += existing_size;
         }
     }
     if (spooled + size > MAX_SPOOL_TOTAL_BYTES) {
@@ -104,14 +105,14 @@ spool_apply(raop_t *raop, spool_job_t *job) {
         logger_log(raop->logger, LOGGER_INFO,
                    "[MEDIA] spooled reverse-fetched media is no longer wanted (item stopped "
                    "or replaced); removing it");
-        if (job->path) unlink(job->path);
+        if (job->path) spool_file_remove(job->path);
         return;
     }
     if (!job->path || !set_spooled_media_path(video, job->path, strlen(job->path))) {
         logger_log(raop->logger, LOGGER_ERR,
                    "[MEDIA] reverse sender-local media could not be spooled (%zu bytes)",
                    job->size);
-        if (job->path) unlink(job->path);
+        if (job->path) spool_file_remove(job->path);
         raop->callbacks.on_video_stop(raop->callbacks.cls);
         raop_destroy_airplay_video(raop, job->video_id);
         return;

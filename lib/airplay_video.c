@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include "raop.h"
+#include "spool_file.h"
 #include "airplay_video.h"
 
 typedef enum playlist_type_e {
@@ -132,7 +133,7 @@ airplay_video_destroy(airplay_video_t *airplay_video) {
         free(airplay_video->playback_location);
     }
     if (airplay_video->spooled_media_path) {
-        unlink(airplay_video->spooled_media_path);
+        spool_file_remove(airplay_video->spooled_media_path);
         free(airplay_video->spooled_media_path);
     }
     if (airplay_video->language_name) {
@@ -255,7 +256,7 @@ bool get_reverse_media_request_sent(airplay_video_t *airplay_video) {
 bool set_spooled_media_path(airplay_video_t *airplay_video, const char *path, size_t len) {
     if (!airplay_video) return false;
     if (airplay_video->spooled_media_path) {
-        unlink(airplay_video->spooled_media_path);
+        spool_file_remove(airplay_video->spooled_media_path);
         free(airplay_video->spooled_media_path);
         airplay_video->spooled_media_path = NULL;
     }

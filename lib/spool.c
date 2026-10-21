@@ -8,6 +8,7 @@
  */
 
 #include "spool.h"
+#include "spool_file.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -58,6 +59,7 @@ log_spool_failure(logger_t *logger, const char *stage, int error_number) {
                stage, error_number, strerror(error_number));
 }
 
+#ifndef _WIN32
 static bool
 safe_spool_directory(const char *directory) {
     if (!directory || directory[0] != '/') return false;
@@ -123,12 +125,22 @@ spool_directory_candidates(char *user_directory, const char *candidates[3]) {
     return candidate_count;
 }
 
+#endif
+
 /* Spool files are removed with their playlist item, but not when the host
    application crashes. Called once at start-up: removes this user's spool
    files that are more than a day old (younger ones may belong to another
    running receiver of the same user). */
 void
 spool_sweep_stale_files(logger_t *logger) {
+#ifdef _WIN32
+    const int removed = spool_win32_sweep();
+    if (removed) {
+        logger_log(logger, LOGGER_INFO,
+                   "[MEDIA] removed %d stale media spool file(s)", removed);
+    }
+}
+#else
     char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
     const char *candidates[3] = {NULL, NULL, NULL};
     const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
@@ -163,6 +175,7 @@ spool_sweep_stale_files(logger_t *logger) {
                    "[MEDIA] removed %d stale media spool file(s)", removed);
     }
 }
+#endif
 
 /* Writes reverse-fetched media to a new private spool file and returns its
    path (caller frees), or NULL. Touches no receiver state, so it runs on the
@@ -177,6 +190,9 @@ spool_write_media(logger_t *logger, const char *data, size_t size, int delay_ms)
         log_spool_failure(logger, "validate", EINVAL);
         return NULL;
     }
+#ifdef _WIN32
+    return spool_win32_write(logger, data, size);
+#else
     char user_directory[MAX_SPOOL_DIRECTORY_BYTES + 1U] = {0};
     const char *candidates[3] = {NULL, NULL, NULL};
     const size_t candidate_count = spool_directory_candidates(user_directory, candidates);
@@ -238,7 +254,7 @@ spool_write_media(logger_t *logger, const char *data, size_t size, int delay_ms)
             failed = true;
         }
         if (failed) {
-            unlink(path);
+            spool_file_remove(path);
             continue;
         }
 
@@ -246,13 +262,14 @@ spool_write_media(logger_t *logger, const char *data, size_t size, int delay_ms)
         char *copy = strdup(path);
         if (!copy) {
             log_spool_failure(logger, "strdup", errno ? errno : ENOMEM);
-            unlink(path);
+            spool_file_remove(path);
             continue;
         }
         return copy;
     }
 
     return NULL;
+#endif
 }
 
 static void
@@ -386,7 +403,7 @@ spool_shutdown(spool_t *spool) {
     for (int i = 0; i < 2; i++) {
         for (spool_job_t *job = lists[i]; job;) {
             spool_job_t *next = job->next;
-            if (job->path) unlink(job->path);
+            if (job->path) spool_file_remove(job->path);
             spool_job_free(job);
             job = next;
         }
