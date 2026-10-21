@@ -22,8 +22,10 @@
 
 #include "logger.h"
 
+#include "media_url.h"
+
 /* the prefix of every spool file name, in the user's temporary folder */
-#define SPOOL_FILE_PREFIX "obs-airplay-fcup-"
+#define SPOOL_FILE_PREFIX MEDIA_SPOOL_FILE_PREFIX
 /* one reverse-fetched reply */
 #define MAX_FCUP_MEDIA_BYTES (128U * 1024U * 1024U)
 /* all spooled items together, on disk */

@@ -18,6 +18,10 @@ extern "C" {
 
 #define MEDIA_URL_HOST_BYTES 256
 
+/* The file name prefix of reverse-fetched media the receiver writes
+   (spool.c), the only local files a media item may be. */
+#define MEDIA_SPOOL_FILE_PREFIX "obs-airplay-fcup-"
+
 typedef enum {
     MEDIA_ADDRESS_ROUTABLE,
     MEDIA_ADDRESS_LOOPBACK,
