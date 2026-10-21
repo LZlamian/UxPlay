@@ -10,6 +10,16 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>
+
+/* Windows has no inet_aton; its own lenient IPv4 parser (what its resolver
+   uses for numeric hosts) takes the same short, octal and hex forms. */
+static int
+media_inet_aton(const char *text, struct in_addr *address) {
+    LPSTR end = NULL;
+    return RtlIpv4StringToAddressA(text, FALSE, &end, address) == 0 && end && *end == '\0';
+}
+#define inet_aton media_inet_aton
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>

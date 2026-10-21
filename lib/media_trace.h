@@ -285,6 +285,16 @@ media_trace_emit(raop_t *raop, const char *prefix, media_trace_buf_t *b) {
 }
 
 /* Append a decoded body: binary plist, XML plist, text, or a hex preview. */
+
+/* "&#" in a body (memmem is not in the Windows C runtime) */
+static bool
+media_trace_has_entity(const char *data, size_t size) {
+    for (size_t i = 0; i + 1 < size; ++i) {
+        if (data[i] == '&' && data[i + 1] == '#') return true;
+    }
+    return false;
+}
+
 static void
 media_trace_append_body(media_trace_buf_t *b, const char *content_type,
                         const char *data, int datalen) {
@@ -299,7 +309,7 @@ media_trace_append_body(media_trace_buf_t *b, const char *content_type,
         if (is_bplist) plist_from_bin_checked(data, (uint32_t) datalen, &root);
         /* (obs-airplay) &#0; would put a NUL in a string: such XML is not
            parsed for the trace */
-        else if (!memmem(data, (size_t) datalen, "&#", 2)) plist_from_xml(data, (uint32_t) datalen, &root);
+        else if (!media_trace_has_entity(data, (size_t) datalen)) plist_from_xml(data, (uint32_t) datalen, &root);
         if (root) {
             media_trace_append(b, " body=%s ", is_bplist ? "bplist" : "xml-plist");
             media_trace_append_plist(b, root, 0);

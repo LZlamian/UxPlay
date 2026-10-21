@@ -552,7 +552,7 @@ extern "C" {
 
 #if defined(__wasm__)
 #define LLHTTP_EXPORT __attribute__((visibility("default")))
-#elif defined(_WIN32)
+#elif defined(_WIN32) && !defined(LLHTTP_STATIC)
 #define LLHTTP_EXPORT __declspec(dllexport)
 #else
 #define LLHTTP_EXPORT

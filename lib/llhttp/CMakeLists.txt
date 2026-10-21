@@ -4,3 +4,5 @@ include_directories(.)
 add_library( llhttp
         STATIC
         ${DIR_SRCS})
+# Static: a DLL linking it must not export llhttp_* (obs-airplay).
+target_compile_definitions( llhttp PUBLIC LLHTTP_STATIC )

@@ -74,7 +74,8 @@ elseif( WIN32 )
                          llhttp
                          wsock32
 			 iphlpapi
-                         ws2_32 )
+                         ws2_32
+                         ntdll )  # RtlIpv4StringToAddressA (media_url.c)
 else()
   target_link_libraries( airplay PUBLIC
           pthread

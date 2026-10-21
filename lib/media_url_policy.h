@@ -19,8 +19,13 @@
 #ifndef MEDIA_URL_POLICY_H
 #define MEDIA_URL_POLICY_H
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#endif
 #include <stdint.h>
 #include <strings.h>
 
